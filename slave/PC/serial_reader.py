@@ -1,11 +1,13 @@
 """
 serial_reader.py
 Arduino からの USB シリアル通信を受信・パースするモジュール
+- 自動再接続機能 (Auto-reconnect)
+- スレッドセーフなデータ保持
+- テスト用シミュレータ (DummySerialReader)
 """
 
 import math
 import random
-import re
 import threading
 import time
 from typing import Callable, Optional, Tuple
@@ -33,11 +35,11 @@ class SerialReader:
         Parameters
         ----------
         port : Optional[str]
-            接続先COMポート (例: 'COM3')。Noneの場合は自動検出を試みる
+            接続先COMポート (例: 'COM3')。Noneの場合は自動検出
         baudrate : int
             Arduino との通信速度 (デフォルト: 115200)
         on_data_received : Optional[Callable[[float, float, float], None]]
-            距離データ (d1_m, d2_m, d3_m) 受信時のコールバック関数
+            距離データ受信時のコールバック
         """
         self.port = port
         self.baudrate = baudrate
@@ -47,37 +49,30 @@ class SerialReader:
         self._thread: Optional[threading.Thread] = None
         self._serial: Optional[serial.Serial] = None
 
-        # 最新の距離データ [m] (スレッドセーフ保持用)
         self.latest_distances: Tuple[float, float, float] = (-1.0, -1.0, -1.0)
         self._lock = threading.Lock()
+        self.is_connected = False
 
     def start(self):
         """受信スレッドの開始"""
         if self._running:
             return
 
-        if not self.port:
-            ports = list_available_ports()
-            if not ports:
-                raise RuntimeError("No serial COM ports found!")
-            self.port = ports[0]
-            print(f"[SerialReader] Auto-selected port: {self.port}")
-
-        self._serial = serial.Serial(
-            self.port, self.baudrate, timeout=1.0
-        )
         self._running = True
-        self._thread = threading.Thread(target=self._read_loop, daemon=True)
+        self._thread = threading.Thread(target=self._connection_loop, daemon=True)
         self._thread.start()
-        print(f"[SerialReader] Started listening on {self.port} at {self.baudrate} bps.")
 
     def stop(self):
         """受信スレッドの停止"""
         self._running = False
+        if self._serial and self._serial.is_open:
+            try:
+                self._serial.close()
+            except Exception:
+                pass
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=1.0)
-        if self._serial and self._serial.is_open:
-            self._serial.close()
+        self.is_connected = False
         print("[SerialReader] Stopped.")
 
     def get_latest_distances(self) -> Tuple[float, float, float]:
@@ -85,54 +80,71 @@ class SerialReader:
         with self._lock:
             return self.latest_distances
 
-    def _read_loop(self):
-        """バックグラウンド受信ループ"""
+    def _connection_loop(self):
+        """接続維持・自動再接続ループ"""
         while self._running:
             try:
-                if not self._serial or not self._serial.is_open:
-                    break
+                target_port = self.port
+                if not target_port:
+                    ports = list_available_ports()
+                    if ports:
+                        target_port = ports[0]
+                    else:
+                        time.sleep(1.0)
+                        continue
 
-                line_bytes = self._serial.readline()
-                if not line_bytes:
-                    continue
+                self._serial = serial.Serial(target_port, self.baudrate, timeout=0.5)
+                self._serial.reset_input_buffer()
+                self.is_connected = True
+                print(f"[SerialReader] Connected to {target_port} at {self.baudrate} bps.")
 
-                line = line_bytes.decode("utf-8", errors="replace").strip()
-                if not line:
-                    continue
+                # 受信ループ
+                while self._running and self._serial.is_open:
+                    line_bytes = self._serial.readline()
+                    if not line_bytes:
+                        continue
 
-                # フォーマット: DIST,d1,d2,d3 (単位: cm)
-                if line.startswith("DIST,"):
-                    parts = line.split(",")
-                    if len(parts) == 4:
-                        try:
-                            # cm から m に変換 (-1 の場合はそのまま -1.0)
-                            d1_cm = float(parts[1])
-                            d2_cm = float(parts[2])
-                            d3_cm = float(parts[3])
+                    line = line_bytes.decode("utf-8", errors="replace").strip()
+                    if not line:
+                        continue
 
-                            d1_m = d1_cm / 100.0 if d1_cm >= 0 else -1.0
-                            d2_m = d2_cm / 100.0 if d2_cm >= 0 else -1.0
-                            d3_m = d3_cm / 100.0 if d3_cm >= 0 else -1.0
+                    # フォーマット: DIST,d1,d2,d3 (単位: cm)
+                    if line.startswith("DIST,"):
+                        parts = line.split(",")
+                        if len(parts) >= 4:
+                            try:
+                                d1_cm = float(parts[1])
+                                d2_cm = float(parts[2])
+                                d3_cm = float(parts[3])
 
-                            with self._lock:
-                                self.latest_distances = (d1_m, d2_m, d3_m)
+                                d1_m = d1_cm / 100.0 if d1_cm > 0 else -1.0
+                                d2_m = d2_cm / 100.0 if d2_cm > 0 else -1.0
+                                d3_m = d3_cm / 100.0 if d3_cm > 0 else -1.0
 
-                            if self.on_data_received:
-                                self.on_data_received(d1_m, d2_m, d3_m)
+                                with self._lock:
+                                    self.latest_distances = (d1_m, d2_m, d3_m)
 
-                        except ValueError:
-                            pass
-                elif line.startswith("#"):
-                    print(f"[Arduino LOG] {line}")
+                                if self.on_data_received:
+                                    self.on_data_received(d1_m, d2_m, d3_m)
 
+                            except ValueError:
+                                pass
+                    elif line.startswith("#"):
+                        print(f"[Arduino] {line}")
+
+            except (serial.SerialException, OSError) as e:
+                self.is_connected = False
+                if self._running:
+                    print(f"[SerialReader] Disconnected / Retrying ({e})...")
+                    time.sleep(1.5)
             except Exception as e:
                 if self._running:
                     print(f"[SerialReader Error] {e}")
-                time.sleep(0.1)
+                    time.sleep(1.0)
 
 
 class DummySerialReader:
-    """実機が無い場合のシミュレーション・テスト用リーダー (円軌道を生成)"""
+    """実機が無い場合のテスト用シミュレータリーダー"""
 
     def __init__(
         self,
@@ -147,12 +159,13 @@ class DummySerialReader:
         self._thread = None
         self.latest_distances = (-1.0, -1.0, -1.0)
         self._lock = threading.Lock()
+        self.is_connected = True
 
     def start(self):
         self._running = True
         self._thread = threading.Thread(target=self._sim_loop, daemon=True)
         self._thread.start()
-        print("[DummySerialReader] Simulation mode started (generating circular trajectory).")
+        print("[DummySerialReader] Simulation mode started (generating 8-figure trajectory).")
 
     def stop(self):
         self._running = False
@@ -164,16 +177,15 @@ class DummySerialReader:
             return self.latest_distances
 
     def _sim_loop(self):
-        # 中心 (0.5, 0.5), 半径 0.25 の円運動
+        # 8の字ループ軌道
         t = 0.0
         while self._running:
-            x = 0.5 + 0.25 * math.cos(t)
-            y = 0.5 + 0.25 * math.sin(t)
+            x = 0.5 + 0.3 * math.cos(t)
+            y = 0.5 + 0.3 * math.sin(2.0 * t) / 2.0
 
-            # ノイズを少し加えた理想距離
-            d1 = math.hypot(x - self.anchors[0][0], y - self.anchors[0][1]) + random.gauss(0, 0.01)
-            d2 = math.hypot(x - self.anchors[1][0], y - self.anchors[1][1]) + random.gauss(0, 0.01)
-            d3 = math.hypot(x - self.anchors[2][0], y - self.anchors[2][1]) + random.gauss(0, 0.01)
+            d1 = math.hypot(x - self.anchors[0][0], y - self.anchors[0][1]) + random.gauss(0, 0.015)
+            d2 = math.hypot(x - self.anchors[1][0], y - self.anchors[1][1]) + random.gauss(0, 0.015)
+            d3 = math.hypot(x - self.anchors[2][0], y - self.anchors[2][1]) + random.gauss(0, 0.015)
 
             with self._lock:
                 self.latest_distances = (d1, d2, d3)
@@ -181,5 +193,5 @@ class DummySerialReader:
             if self.on_data_received:
                 self.on_data_received(d1, d2, d3)
 
-            t += 0.1
+            t += 0.05
             time.sleep(0.05)
