@@ -53,9 +53,17 @@ RYUW122搭載 UWB評価用ブレークアウトボード（秋月電子通商: 1
 ```text
 Local_GPS/
 ├── Datasheet/
-│   └── RYUW122_Lite.pdf       # UWBモジュールデータシート
+│   ├── RYUW122_EN.pdf         # UWBモジュールデータシート
+│   └── RYUW122_Lite.pdf       # 評価ボードデータシート
 ├── master/                    # ロボット側（Master / Tag）関連プログラム・設定
-├── slave/                     # 地上基準点側（Slave 1〜3 / Anchor）Arduinoスケッチ・PC側受信/描画スクリプト
+├── slave/                     # 地上基準点側（Slave 1〜3 / Anchor）
+│   ├── slave_controller/      # 3連Anchor統合制御スケッチ (Arduino Uno)
+│   ├── slave_config_tool/     # モジュール初期設定・ATコマンド設定ツール
+│   └── PC/                    # PC側受信・三辺測量・リアルタイム描画プログラム
+│       ├── main.py            # メイン可視化アプリケーション
+│       ├── trilateration.py   # 三辺測量アルゴリズム
+│       ├── serial_reader.py   # シリアル受信・シミュレータ
+│       └── requirements.txt   # 依存ライブラリ一覧
 ├── .gitignore                 # バージョン管理除外設定
 └── README.md                  # 本ドキュメント
 ```
