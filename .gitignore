@@ -1,0 +1,29 @@
+# Python / 仮想環境関連
+venv/
+.venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyd
+
+# Arduino / ビルド成果物
+build/
+*.hex
+*.elf
+
+# エディタ・IDE設定・一時ファイル
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# ログファイル・一時データ・ローカル環境特有ファイル
+*.log
+*.csv
+*.tmp
+local_settings.*
+.env
+
