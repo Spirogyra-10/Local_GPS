@@ -6,15 +6,19 @@
  * SoftwareSerial を用いて時分割順次ポーリングし、
  * ロボット側 Tag (Master) との距離を取得して PC へシリアル出力します。
  * 
- * 【改善点・見直しポイント】
- * 1. String クラスを全廃し、固定長 char バッファを使用（RAM 2KB の断片化・フリーズ防止）
- * 2. SoftwareSerial 切替 (listen()) 後の安定化ディレイ (10ms) を追加
- * 3. タイムアウト値を 250ms -> 120ms に短縮し、サンプリングレートを高速化
- * 4. 内蔵 LED (D13) を利用したハートビート点滅インジケータ
- * 5. 測定値の妥当性検証（0cm以下または最大距離オーバーの除外）
+ * 【デバッグ機能】
+ * - PCから 'd' または 'D' を送信すると、詳細デバッグログ ⇔ CSV出力 をリアルタイム切替可能
+ * - 各Slaveの送受信ログ、生レスポンス、タイムアウト状態を可視化
  */
 
 #include <SoftwareSerial.h>
+
+// ==========================================
+// デバッグ設定
+// ==========================================
+// 起動時のデバッグモード (true: 詳細ログ出力, false: 本番CSV出力)
+// ※ 実行中にシリアルモニタから 'd' を送るといつでも切替可能です
+bool isDebugMode = false;
 
 // ==========================================
 // ピン配置設定 (Arduino Uno R3)
@@ -50,7 +54,7 @@ const unsigned long RANGING_TIMEOUT_MS = 120;
 // ポート切り替え後の安定化ウェイト [ms]
 const unsigned long SWITCH_DELAY_MS = 10;
 
-// 測定値の上限 [cm] (定格100mだが屋内測位として30m以上はノイズとみなす)
+// 測定値の上限 [cm]
 const long MAX_VALID_DISTANCE_CM = 3000;
 
 // ==========================================
@@ -63,8 +67,9 @@ SoftwareSerial uwbSerial3(SLAVE3_RX_PIN, SLAVE3_TX_PIN);
 // ==========================================
 // プロトタイプ宣言
 // ==========================================
-long measureDistance(SoftwareSerial &serial);
+long measureDistance(SoftwareSerial &serial, const char *anchorTag);
 void clearSerialBuffer(SoftwareSerial &serial);
+void checkDebugCommand();
 
 void setup() {
   pinMode(HEARTBEAT_LED, OUTPUT);
@@ -81,48 +86,87 @@ void setup() {
   uwbSerial2.begin(UWB_BAUDRATE);
   uwbSerial3.begin(UWB_BAUDRATE);
 
-  Serial.println(F("# SYSTEM_START: Local GPS Slave Controller v1.1"));
-  Serial.println(F("# Output format: DIST,d1_cm,d2_cm,d3_cm (d=-1 on error/timeout)"));
+  Serial.println(F("# =================================================="));
+  Serial.println(F("# SYSTEM_START: Local GPS Slave Controller v1.2    "));
+  Serial.println(F("# Send 'd' or 'D' via Serial to TOGGLE DEBUG LOGS  "));
+  Serial.println(F("# =================================================="));
   delay(200);
 }
 
 void loop() {
+  // PCからのデバッグ切替コマンド確認
+  checkDebugCommand();
+
   static bool ledState = false;
   ledState = !ledState;
   digitalWrite(HEARTBEAT_LED, ledState ? HIGH : LOW);
 
   // 1. Slave 1 (原点: 0, 0)
-  long d1 = measureDistance(uwbSerial1);
+  long d1 = measureDistance(uwbSerial1, "S1");
 
   // 2. Slave 2 (Y軸: 0, 1.0)
-  long d2 = measureDistance(uwbSerial2);
+  long d2 = measureDistance(uwbSerial2, "S2");
 
   // 3. Slave 3 (X軸: 1.0, 0)
-  long d3 = measureDistance(uwbSerial3);
+  long d3 = measureDistance(uwbSerial3, "S3");
 
-  // PCへデータ出力 (フォーマット: DIST,d1,d2,d3)
-  // 例: DIST,120,85,150  (単位: cm, 失敗時は -1)
-  Serial.print(F("DIST,"));
-  Serial.print(d1);
-  Serial.print(F(","));
-  Serial.print(d2);
-  Serial.print(F(","));
-  Serial.println(d3);
+  // データ出力
+  if (isDebugMode) {
+    Serial.print(F("[SUMMARY] S1: "));
+    Serial.print(d1);
+    Serial.print(F(" cm | S2: "));
+    Serial.print(d2);
+    Serial.print(F(" cm | S3: "));
+    Serial.print(d3);
+    Serial.println(F(" cm"));
+    Serial.println(F("--------------------------------------------------"));
+  } else {
+    // 本番CSV出力フォーマット: DIST,d1,d2,d3
+    Serial.print(F("DIST,"));
+    Serial.print(d1);
+    Serial.print(F(","));
+    Serial.print(d2);
+    Serial.print(F(","));
+    Serial.println(d3);
+  }
+}
+
+/**
+ * @brief PCからのデバッグ切り替えキー ('d' / 'D') をチェック
+ */
+void checkDebugCommand() {
+  if (Serial.available()) {
+    char c = Serial.read();
+    if (c == 'd' || c == 'D') {
+      isDebugMode = !isDebugMode;
+      Serial.print(F("# [MODE CHANGED] Debug Mode is now: "));
+      Serial.println(isDebugMode ? F("ON (Verbose Logs)") : F("OFF (CSV Output)"));
+    }
+  }
 }
 
 /**
  * @brief 指定したSoftwareSerialポートに対して測距コマンドを送信し、距離を取得する
  * 
  * @param serial 対象の SoftwareSerial インスタンス
+ * @param anchorTag アンカーの識別名 (例: "S1")
  * @return long 測定された距離 [cm] (失敗・タイムアウト時は -1)
  */
-long measureDistance(SoftwareSerial &serial) {
+long measureDistance(SoftwareSerial &serial, const char *anchorTag) {
   // SoftwareSerial で複数ポートを扱う場合、受信対象を明示的に切り替える
   serial.listen();
-  delay(SWITCH_DELAY_MS); // 切替後のピン割り込み安定化
+  delay(SWITCH_DELAY_MS);
   clearSerialBuffer(serial);
 
-  // 測距要求コマンド: AT+ANCHOR_SEND=<Address>,<Length>,<Data>\r\n
+  if (isDebugMode) {
+    Serial.print(F("["));
+    Serial.print(anchorTag);
+    Serial.print(F("] TX: AT+ANCHOR_SEND="));
+    Serial.print(TARGET_TAG_ADDR);
+    Serial.println(F(",4,PING"));
+  }
+
+  // 測距要求コマンド送信
   serial.print(F("AT+ANCHOR_SEND="));
   serial.print(TARGET_TAG_ADDR);
   serial.print(F(",4,PING\r\n"));
@@ -135,12 +179,17 @@ long measureDistance(SoftwareSerial &serial) {
     while (serial.available() > 0) {
       char c = serial.read();
       if (c == '\n') {
-        // 行終端
         rxBuf[bufIdx] = '\0';
+
+        if (isDebugMode) {
+          Serial.print(F("["));
+          Serial.print(anchorTag);
+          Serial.print(F("] RX: "));
+          Serial.println(rxBuf);
+        }
 
         // 成功レスポンス: +ANCHOR_RCV=<Tag_Address>,<Length>,<Data>,<Distance_cm>
         if (strncmp(rxBuf, "+ANCHOR_RCV=", 12) == 0) {
-          // 最後のカンマを探して距離文字列を抽出
           char *lastComma = strrchr(rxBuf, ',');
           if (lastComma != NULL) {
             long dist = atol(lastComma + 1);
@@ -149,10 +198,14 @@ long measureDistance(SoftwareSerial &serial) {
             }
           }
         } else if (strncmp(rxBuf, "+ERR", 4) == 0) {
+          if (isDebugMode) {
+            Serial.print(F("["));
+            Serial.print(anchorTag);
+            Serial.println(F("] -> Received ERROR response"));
+          }
           return -1;
         }
 
-        // 次の行に備えてバッファクリア
         bufIdx = 0;
       } else if (c != '\r') {
         if (bufIdx < sizeof(rxBuf) - 1) {
@@ -162,7 +215,12 @@ long measureDistance(SoftwareSerial &serial) {
     }
   }
 
-  // タイムアウト
+  if (isDebugMode) {
+    Serial.print(F("["));
+    Serial.print(anchorTag);
+    Serial.println(F("] -> TIMEOUT (No response from module or tag)"));
+  }
+
   return -1;
 }
 
