@@ -34,8 +34,8 @@ const unsigned long UWB_BAUDRATE = 9600;
 
 const char TARGET_TAG_ADDR[] = "TAG1";
 
-const unsigned long DEFAULT_RANGING_TIMEOUT_MS = 200;
-const unsigned long SWITCH_DELAY_MS = 15;
+const unsigned long DEFAULT_RANGING_TIMEOUT_MS = 300;
+const unsigned long SWITCH_DELAY_MS = 25;
 const unsigned long CALIBRATION_INTERVAL_MS = 5000;
 const long MAX_VALID_DISTANCE_CM = 3000;
 
@@ -54,6 +54,7 @@ unsigned long lastCalibTime = 0;
 // プロトタイプ宣言
 // ==========================================
 long measureDistance(SoftwareSerial &serial, const char *targetAddr, const char *anchorTag, unsigned long timeoutMs = DEFAULT_RANGING_TIMEOUT_MS);
+bool setModuleMode(SoftwareSerial &serial, uint8_t mode);
 void clearSerialBuffer(SoftwareSerial &serial);
 void checkDebugCommand();
 void resetAllUwbModules();
@@ -67,13 +68,15 @@ void setup() {
   while (!Serial);
 
   Serial.println(F("# =================================================="));
-  Serial.println(F("# SYSTEM_START: Local GPS Slave Controller v2.2    "));
+  Serial.println(F("# SYSTEM_START: Local GPS Slave Controller v2.3    "));
   Serial.println(F("# Auto-Calibration: 5s Interval (S1->S2, S1->S3)    "));
   Serial.println(F("# Hardware Auto-Reset on Pin D8                     "));
   Serial.println(F("# =================================================="));
 
+  // 1. ハードウェアリセット
   resetAllUwbModules();
 
+  // 2. 各 SoftwareSerial 初期化
   uwbSerial1.begin(UWB_BAUDRATE);
   uwbSerial2.begin(UWB_BAUDRATE);
   uwbSerial3.begin(UWB_BAUDRATE);
@@ -82,11 +85,16 @@ void setup() {
   clearSerialBuffer(uwbSerial2);
   clearSerialBuffer(uwbSerial3);
 
-  // 初回キャリブレーション
+  // 3. 全モジュールを確実に Anchor モード (MODE=1) に固定
+  setModuleMode(uwbSerial1, 1);
+  setModuleMode(uwbSerial2, 1);
+  setModuleMode(uwbSerial3, 1);
+
+  // 4. 初回自動キャリブレーション
   runAnchorCalibration();
   lastCalibTime = millis();
 
-  Serial.println(F("# [READY] Controller Active."));
+  Serial.println(F("# [READY] Controller Active. Polling All 3 Anchors."));
   delay(100);
 }
 
@@ -105,7 +113,9 @@ void loop() {
 
   // 2. ロボット側 Tag (Master) の測距
   long d1 = measureDistance(uwbSerial1, TARGET_TAG_ADDR, "S1");
+  delay(30);
   long d2 = measureDistance(uwbSerial2, TARGET_TAG_ADDR, "S2");
+  delay(30);
   long d3 = measureDistance(uwbSerial3, TARGET_TAG_ADDR, "S3");
 
   // 3. データ出力
@@ -123,6 +133,7 @@ void loop() {
     Serial.println(F(" cm"));
     Serial.println(F("--------------------------------------------------"));
   } else {
+    // 本番CSV出力: DIST,d1,d2,d3
     Serial.print(F("DIST,"));
     Serial.print(d1);
     Serial.print(F(","));
@@ -130,6 +141,43 @@ void loop() {
     Serial.print(F(","));
     Serial.println(d3);
   }
+}
+
+/**
+ * @brief モード切り替えを確実に実行し +OK を検証する
+ */
+bool setModuleMode(SoftwareSerial &serial, uint8_t mode) {
+  serial.listen();
+  delay(SWITCH_DELAY_MS);
+  clearSerialBuffer(serial);
+
+  for (int retry = 0; retry < 3; retry++) {
+    serial.print(F("AT+MODE="));
+    serial.print(mode);
+    serial.print(F("\r\n"));
+
+    unsigned long t0 = millis();
+    char buf[32];
+    uint8_t idx = 0;
+    while (millis() - t0 < 350) {
+      while (serial.available()) {
+        char c = serial.read();
+        if (c == '\n') {
+          buf[idx] = '\0';
+          if (strstr(buf, "+OK") != NULL) {
+            delay(200); // 内部リセット・RF安定化待機
+            clearSerialBuffer(serial);
+            return true;
+          }
+          idx = 0;
+        } else if (c != '\r' && idx < sizeof(buf) - 1) {
+          buf[idx++] = c;
+        }
+      }
+    }
+    delay(50);
+  }
+  return false;
 }
 
 /**
@@ -141,44 +189,27 @@ void runAnchorCalibration() {
   }
 
   // --- Step 1: Slave 2 を一時的に TAG モードに切り替え ---
-  uwbSerial2.listen();
-  delay(SWITCH_DELAY_MS);
-  uwbSerial2.print(F("AT+MODE=0\r\n"));
-  delay(200);
-  clearSerialBuffer(uwbSerial2);
+  if (setModuleMode(uwbSerial2, 0)) {
+    // Slave 1 から Slave 2 を測距
+    long d12_meas = measureDistance(uwbSerial1, "SLAVE2", "CALIB_S1->S2", 400);
+    // Slave 2 を確実に ANCHOR モードに復旧
+    setModuleMode(uwbSerial2, 1);
 
-  // Slave 1 から Slave 2 を測距 (タイムアウト 400ms)
-  long d12_meas = measureDistance(uwbSerial1, "SLAVE2", "CALIB_S1->S2", 400);
-
-  // Slave 2 を ANCHOR モードに復旧
-  uwbSerial2.listen();
-  delay(SWITCH_DELAY_MS);
-  uwbSerial2.print(F("AT+MODE=1\r\n"));
-  delay(200);
-  clearSerialBuffer(uwbSerial2);
+    if (d12_meas > 0 && d12_meas <= MAX_VALID_DISTANCE_CM) {
+      calib_d12 = d12_meas;
+    }
+  }
 
   // --- Step 2: Slave 3 を一時的に TAG モードに切り替え ---
-  uwbSerial3.listen();
-  delay(SWITCH_DELAY_MS);
-  uwbSerial3.print(F("AT+MODE=0\r\n"));
-  delay(200);
-  clearSerialBuffer(uwbSerial3);
+  if (setModuleMode(uwbSerial3, 0)) {
+    // Slave 1 から Slave 3 を測距
+    long d13_meas = measureDistance(uwbSerial1, "SLAVE3", "CALIB_S1->S3", 400);
+    // Slave 3 を確実に ANCHOR モードに復旧
+    setModuleMode(uwbSerial3, 1);
 
-  // Slave 1 から Slave 3 を測距 (タイムアウト 400ms)
-  long d13_meas = measureDistance(uwbSerial1, "SLAVE3", "CALIB_S1->S3", 400);
-
-  // Slave 3 を ANCHOR モードに復旧
-  uwbSerial3.listen();
-  delay(SWITCH_DELAY_MS);
-  uwbSerial3.print(F("AT+MODE=1\r\n"));
-  delay(200);
-  clearSerialBuffer(uwbSerial3);
-
-  if (d12_meas > 0 && d12_meas <= MAX_VALID_DISTANCE_CM) {
-    calib_d12 = d12_meas;
-  }
-  if (d13_meas > 0 && d13_meas <= MAX_VALID_DISTANCE_CM) {
-    calib_d13 = d13_meas;
+    if (d13_meas > 0 && d13_meas <= MAX_VALID_DISTANCE_CM) {
+      calib_d13 = d13_meas;
+    }
   }
 
   // PCへキャリブレーション結果を出力: CALIB,d12,d13
