@@ -69,8 +69,8 @@ void setup() {
   while (!Serial);
 
   Serial.println(F("# =================================================="));
-  Serial.println(F("# SYSTEM_START: Local GPS Slave Controller v2.3    "));
-  Serial.println(F("# Auto-Calibration: 5s Interval (S1->S2, S1->S3)    "));
+  Serial.println(F("# SYSTEM_START: Local GPS Slave Controller v2.4    "));
+  Serial.println(F("# Auto-Calibration: Startup & On-Demand ('C' key)   "));
   Serial.println(F("# Hardware Auto-Reset on Pin D8                     "));
   Serial.println(F("# =================================================="));
 
@@ -91,11 +91,10 @@ void setup() {
   setModuleMode(uwbSerial2, 1);
   setModuleMode(uwbSerial3, 1);
 
-  // 4. 初回自動キャリブレーション
+  // 4. 初回自動キャリブレーション (起動時のみ実行し、ロボット追従中の停止を排除)
   runAnchorCalibration();
-  lastCalibTime = millis();
 
-  Serial.println(F("# [READY] Controller Active. Polling All 3 Anchors."));
+  Serial.println(F("# [READY] Controller Active. Continuous Polling 10-15Hz."));
   delay(100);
 }
 
@@ -106,20 +105,14 @@ void loop() {
   ledState = !ledState;
   digitalWrite(HEARTBEAT_LED, ledState ? HIGH : LOW);
 
-  // 1. 定期アンカー自動キャリブレーション (5秒に1回)
-  if (millis() - lastCalibTime >= CALIBRATION_INTERVAL_MS) {
-    lastCalibTime = millis();
-    runAnchorCalibration();
-  }
-
-  // 2. ロボット側 Tag (Master) の測距
+  // 1. ロボット側 Tag (Master) の高速連続測距 (キャリブレーションによる停止なし)
   long d1 = measureDistance(uwbSerial1, TARGET_TAG_ADDR, "S1");
   delay(20);
   long d2 = measureDistance(uwbSerial2, TARGET_TAG_ADDR, "S2");
   delay(20);
   long d3 = measureDistance(uwbSerial3, TARGET_TAG_ADDR, "S3");
 
-  // 3. データ出力
+  // 2. データ出力
   if (isDebugMode) {
     Serial.print(F("[SUMMARY] S1: "));
     Serial.print(d1);
@@ -287,12 +280,16 @@ void resetAllUwbModules() {
 }
 
 void checkDebugCommand() {
-  if (Serial.available()) {
+  while (Serial.available()) {
     char c = Serial.read();
     if (c == 'd' || c == 'D') {
       isDebugMode = !isDebugMode;
       Serial.print(F("# [MODE CHANGED] Debug Mode is now: "));
       Serial.println(isDebugMode ? F("ON (Verbose Logs)") : F("OFF (CSV Output)"));
+    } else if (c == 'c' || c == 'C') {
+      Serial.println(F("# [COMMAND] On-demand Auto-Calibration Requested..."));
+      runAnchorCalibration();
+      Serial.println(F("# [COMMAND] Auto-Calibration Finished. Resuming tracking."));
     }
   }
 }

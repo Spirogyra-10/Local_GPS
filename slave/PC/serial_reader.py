@@ -87,6 +87,14 @@ class SerialReader:
         with self._lock:
             return self.latest_distances
 
+    def write(self, data: bytes):
+        """シリアルポート経由でコマンドを送信"""
+        if self._serial and self._serial.is_open:
+            try:
+                self._serial.write(data)
+            except Exception as e:
+                print(f"[SerialReader] Write error: {e}")
+
     def _connection_loop(self):
         """接続維持・自動再接続ループ"""
         while self._running:

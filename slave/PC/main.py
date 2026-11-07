@@ -65,6 +65,13 @@ class LocalGPSVisualizer:
 
         # プロット要素の初期化
         self.setup_plot()
+        self.fig.canvas.mpl_connect("key_press_event", self.on_key_press)
+
+    def on_key_press(self, event):
+        if event.key in ("c", "C"):
+            if hasattr(self.reader, "write"):
+                self.reader.write(b"c\n")
+                print("\n[GUI] 'C' key pressed -> Sent re-calibration request to Arduino.")
 
     def setup_plot(self):
         self.ax.set_title("Realtime 2D Robot Position (UWB Trilateration)", fontsize=14, fontweight="bold")
@@ -223,6 +230,7 @@ class LocalGPSVisualizer:
             f"───────────────────────────────\n"
             f"Calib S1-S2(Y): {c12:.2f} m\n"
             f"Calib S1-S3(X): {c13:.2f} m\n"
+            f"[Press 'C' to Re-Calibrate]\n"
             f"───────────────────────────────\n"
         )
         if pos is not None:
