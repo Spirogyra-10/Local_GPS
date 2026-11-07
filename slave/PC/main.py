@@ -7,6 +7,7 @@ Local GPS - UWB 自己位置推定 リアルタイム可視化 & ロギングア
 import argparse
 import csv
 import datetime
+import math
 import os
 import sys
 
@@ -14,7 +15,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import matplotlib.pyplot as plt
-from matplotlib.patches import Circle
+from matplotlib.patches import Circle, Ellipse
 import numpy as np
 
 from trilateration import DistanceFilter, MovingAverageFilter, Trilateration
@@ -53,6 +54,9 @@ class LocalGPSVisualizer:
         self.csv_writer = None
         self.plot_range = plot_range
         self.latest_calib = (anchor2[1], anchor3[0])
+        self.show_gdop_ellipse = True
+        self.latest_gdop = 1.0
+        self.latest_gdop_rating = "EXCELLENT"
 
         # キャリブレーション受信コールバック登録
         if hasattr(self.reader, "on_calib_received"):
@@ -73,6 +77,10 @@ class LocalGPSVisualizer:
                     "est_x_m",
                     "est_y_m",
                     "mode",
+                    "hdop",
+                    "gdop_rating",
+                    "ellipse_major_m",
+                    "ellipse_minor_m",
                     "calib_d12",
                     "calib_d13",
                     "relabel",
@@ -85,7 +93,7 @@ class LocalGPSVisualizer:
 
         # Matplotlib 設定
         self.fig, self.ax = plt.subplots(figsize=(9, 9))
-        self.fig.canvas.manager.set_window_title("Local GPS - UWB Positioning Monitor (Auto-Relabeled)")
+        self.fig.canvas.manager.set_window_title("Local GPS - UWB Positioning Monitor (Auto-Relabeled & GDOP)")
 
         # プロット要素の初期化
         self.setup_plot()
@@ -114,9 +122,13 @@ class LocalGPSVisualizer:
             self.on_calib_update(*getattr(self, "latest_calib", (self.tri.d12, self.tri.d13)))
             state_str = "SWAPPED (Port 3->S2, Port 2->S3)" if self.tri.is_swapped else "NORMAL (Port 2->S2, Port 3->S3)"
             print(f"\n[GUI] 'R' key pressed -> Manual mapping toggle: {state_str}")
+        elif event.key in ("g", "G"):
+            # GDOP 信頼楕円表示トグル
+            self.show_gdop_ellipse = not self.show_gdop_ellipse
+            print(f"\n[GUI] 'G' key pressed -> GDOP Confidence Ellipse: {'ON' if self.show_gdop_ellipse else 'OFF'}")
 
     def setup_plot(self):
-        self.ax.set_title("Realtime 2D Robot Position (UWB Trilateration)", fontsize=14, fontweight="bold")
+        self.ax.set_title("Realtime 2D Robot Position (UWB Trilateration + GDOP Quality)", fontsize=13, fontweight="bold")
         self.ax.set_xlabel("X [m]", fontsize=12)
         self.ax.set_ylabel("Y [m]", fontsize=12)
         self.ax.grid(True, linestyle="--", alpha=0.5)
@@ -135,7 +147,7 @@ class LocalGPSVisualizer:
             c="royalblue",
             s=140,
             marker="s",
-            zorder=5,
+            zorder=6,
             edgecolors="navy",
             linewidths=1.5,
             label="Anchors (Slaves)",
@@ -164,10 +176,27 @@ class LocalGPSVisualizer:
             [], [], color="deepskyblue", linestyle="-", linewidth=1.8, alpha=0.65, label="Trajectory"
         )
 
+        # 95% 信頼楕円 (Error Confidence Ellipse: GDOP 可視化)
+        self.ellipse_confidence = Ellipse(
+            (0, 0),
+            width=0.2,
+            height=0.2,
+            angle=0,
+            fill=True,
+            facecolor="limegreen",
+            edgecolor="darkgreen",
+            alpha=0.35,
+            linestyle="--",
+            linewidth=1.6,
+            zorder=4,
+            label="Confidence (95%)",
+        )
+        self.ax.add_patch(self.ellipse_confidence)
+
         # 現在位置プロット (Tag / Robot)
         (self.scatter_robot,) = self.ax.plot(
             [], [], marker="o", color="limegreen", markersize=14, markeredgecolor="darkgreen",
-            markeredgewidth=2.0, zorder=6, label="Robot (Tag)"
+            markeredgewidth=2.0, zorder=7, label="Robot (Tag)"
         )
 
         # 測距円 (各アンカーからの円)
@@ -239,6 +268,45 @@ class LocalGPSVisualizer:
         if pos is not None and self.filter:
             pos = self.filter.update(pos)
 
+        # 4. GDOP (幾何学的精度低下率) & 95% 信頼楕円の算出
+        hdop = 1.0
+        semi_major = 0.1
+        semi_minor = 0.1
+        angle_deg = 0.0
+        gdop_rating = "EXCELLENT"
+
+        if pos is not None:
+            hdop, semi_major, semi_minor, angle_deg, gdop_rating = self.tri.calculate_gdop(pos)
+            self.latest_gdop = hdop
+            self.latest_gdop_rating = gdop_rating
+
+            if self.show_gdop_ellipse:
+                self.ellipse_confidence.center = pos
+                # Ellipse の width, height は全幅・全高 (2 * 半径)
+                self.ellipse_confidence.width = 2.0 * semi_major
+                self.ellipse_confidence.height = 2.0 * semi_minor
+                self.ellipse_confidence.angle = angle_deg
+
+                # 精度評価に応じた色分け (良: 緑, 中: 黄, 警戒: 橙, 危険: 赤)
+                if gdop_rating == "EXCELLENT":
+                    self.ellipse_confidence.set_facecolor("limegreen")
+                    self.ellipse_confidence.set_edgecolor("darkgreen")
+                elif gdop_rating == "GOOD":
+                    self.ellipse_confidence.set_facecolor("gold")
+                    self.ellipse_confidence.set_edgecolor("darkgoldenrod")
+                elif gdop_rating == "MODERATE":
+                    self.ellipse_confidence.set_facecolor("darkorange")
+                    self.ellipse_confidence.set_edgecolor("orangered")
+                else:
+                    self.ellipse_confidence.set_facecolor("crimson")
+                    self.ellipse_confidence.set_edgecolor("darkred")
+
+                self.ellipse_confidence.set_visible(True)
+            else:
+                self.ellipse_confidence.set_visible(False)
+        else:
+            self.ellipse_confidence.set_visible(False)
+
         # CSV ロギング
         if self.csv_writer:
             ts = datetime.datetime.now().isoformat()
@@ -246,7 +314,25 @@ class LocalGPSVisualizer:
             py = f"{pos[1]:.4f}" if pos else ""
             relabel_flag = "SWAPPED" if self.tri.is_swapped else "NORMAL"
             self.csv_writer.writerow(
-                [ts, raw_d1, raw_d2, raw_d3, d1, d2, d3, px, py, mode, c12, c13, relabel_flag]
+                [
+                    ts,
+                    raw_d1,
+                    raw_d2,
+                    raw_d3,
+                    d1,
+                    d2,
+                    d3,
+                    px,
+                    py,
+                    mode,
+                    f"{hdop:.2f}",
+                    gdop_rating,
+                    f"{semi_major:.3f}",
+                    f"{semi_minor:.3f}",
+                    c12,
+                    c13,
+                    relabel_flag,
+                ]
             )
 
         # プロット更新
@@ -300,11 +386,12 @@ class LocalGPSVisualizer:
             f"Mapping: {relabel_desc}\n"
             f"Calib S2(Y): {self.tri.d12:.2f} m (Nom: {self.tri.nominal_d12:.2f}m)\n"
             f"Calib S3(X): {self.tri.d13:.2f} m (Nom: {self.tri.nominal_d13:.2f}m)\n"
-            f"[C] Re-Calib | [R] Toggle Swap\n"
+            f"[C] Calib | [R] Swap | [G] GDOP\n"
             f"───────────────────────────────\n"
         )
         if pos is not None:
-            status_str += f"Robot: X={pos[0]:.3f} m, Y={pos[1]:.3f} m\nMode:  {mode}"
+            gdop_badge = f"GDOP:  {hdop:.1f} [{gdop_rating}] (±{semi_major:.2f}m)"
+            status_str += f"Robot: X={pos[0]:.3f} m, Y={pos[1]:.3f} m\n{gdop_badge}\nMode:  {mode}"
         else:
             status_str += f"Robot: Searching...\nMode:  {mode}"
 

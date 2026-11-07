@@ -113,6 +113,71 @@ class Trilateration:
             return raw_d1, raw_d3, raw_d2
         return raw_d1, raw_d2, raw_d3
 
+    def calculate_gdop(
+        self, pos: Tuple[float, float], sigma_r: float = 0.05
+    ) -> Tuple[float, float, float, float, str]:
+        """指定された座標における幾何学的精度低下率 (HDOP) および 95% 信頼楕円パラメータを算出する
+
+        Parameters
+        ----------
+        pos : Tuple[float, float]
+            評価対象の (x, y) 座標 [m]
+        sigma_r : float
+            UWB 測距誤差の標準偏差 [m] (デフォルト: 0.05m = 5cm)
+
+        Returns
+        -------
+        hdop : float
+            幾何学的精度低下率 (HDOP: 水平精度低下率)
+        semi_major_m : float
+            95% 信頼楕円の長半径 [m] (2 * sigma)
+        semi_minor_m : float
+            95% 信頼楕円の短半径 [m] (2 * sigma)
+        orientation_deg : float
+            信頼楕円の長軸方向角 [度] (X軸基準反時計回り)
+        rating : str
+            配置精度評価 ("EXCELLENT", "GOOD", "MODERATE", "POOR (SPREAD ANCHORS!)")
+        """
+        p = np.array(pos, dtype=float)
+        diff = p - self.anchors  # shape: (3, 2)
+        dists = np.hypot(diff[:, 0], diff[:, 1])[:, np.newaxis]
+        dists = np.maximum(dists, 1e-4)
+
+        # 視線方向の単位ベクトル行列 (設計行列 H)
+        H = diff / dists  # shape: (3, 2)
+        A = H.T @ H       # shape: (2, 2)
+
+        det = float(np.linalg.det(A))
+        if det < 1e-6:
+            return 99.9, 5.0, 5.0, 0.0, "POOR (SPREAD ANCHORS!)"
+
+        try:
+            Q = np.linalg.inv(A)
+            hdop = float(np.sqrt(max(0.0, np.trace(Q))))
+
+            # 信頼楕円パラメータ (共分散幾何行列 Q の固有値分解)
+            evals, evecs = np.linalg.eigh(Q)
+            order = np.argsort(evals)[::-1]
+            evals = evals[order]
+            evecs = evecs[:, order]
+
+            semi_major = float(2.0 * sigma_r * np.sqrt(max(0.0, evals[0])))
+            semi_minor = float(2.0 * sigma_r * np.sqrt(max(0.0, evals[1])))
+            angle_deg = float(np.degrees(np.arctan2(evecs[1, 0], evecs[0, 0])) % 360)
+
+            if hdop < 2.5:
+                rating = "EXCELLENT"
+            elif hdop < 5.0:
+                rating = "GOOD"
+            elif hdop < 10.0:
+                rating = "MODERATE"
+            else:
+                rating = "POOR (SPREAD ANCHORS!)"
+
+            return hdop, semi_major, semi_minor, angle_deg, rating
+        except Exception:
+            return 99.9, 5.0, 5.0, 0.0, "POOR (SPREAD ANCHORS!)"
+
     def calculate_position(
         self, d1: float, d2: float, d3: float, allow_fallback: bool = True
     ) -> Tuple[Optional[Tuple[float, float]], str]:
@@ -409,5 +474,16 @@ if __name__ == "__main__":
     print(f"Relabeled Position Test: pos={pos_rel}, mode={mode_rel}")
     assert pos_rel is not None
     assert abs(pos_rel[0] - 0.5) < 1e-2 and abs(pos_rel[1] - 0.5) < 1e-2
+
+    # 5. GDOP & 信頼楕円計算テスト
+    tri_wide = Trilateration(anchor1=(0.0, 0.0), anchor2=(0.0, 2.0), anchor3=(2.0, 0.0))
+    hdop_w, a_w, b_w, ang_w, rating_w = tri_wide.calculate_gdop((1.0, 1.0))
+    print(f"Wide GDOP Test: hdop={hdop_w:.2f}, rating={rating_w}, ellipse=({a_w:.3f}m, {b_w:.3f}m)")
+    assert hdop_w < 2.5 and rating_w == "EXCELLENT"
+
+    tri_narrow = Trilateration(anchor1=(0.0, 0.0), anchor2=(0.0, 0.2), anchor3=(0.2, 0.0))
+    hdop_n, a_n, b_n, ang_n, rating_n = tri_narrow.calculate_gdop((3.0, 3.0))
+    print(f"Narrow GDOP Test: hdop={hdop_n:.2f}, rating={rating_n}, ellipse=({a_n:.3f}m, {b_n:.3f}m)")
+    assert hdop_n > 10.0 and rating_n == "POOR (SPREAD ANCHORS!)"
 
     print("All Trilateration tests passed!")
