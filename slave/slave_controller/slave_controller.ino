@@ -145,14 +145,17 @@ void loop() {
 }
 
 /**
- * @brief モード切り替えを確実に実行し +OK を検証する
+ * @brief モード切り替えを確実に実行し、AT+MODE? で反映を厳密に検証する
  */
 bool setModuleMode(SoftwareSerial &serial, uint8_t mode) {
   serial.listen();
   delay(SWITCH_DELAY_MS);
   clearSerialBuffer(serial);
 
-  for (int retry = 0; retry < 3; retry++) {
+  char modeStr[12];
+  snprintf(modeStr, sizeof(modeStr), "+MODE=%d", mode);
+
+  for (int retry = 0; retry < 4; retry++) {
     serial.print(F("AT+MODE="));
     serial.print(mode);
     serial.print(F("\r\n"));
@@ -160,15 +163,42 @@ bool setModuleMode(SoftwareSerial &serial, uint8_t mode) {
     unsigned long t0 = millis();
     char buf[32];
     uint8_t idx = 0;
-    while (millis() - t0 < 350) {
+    bool gotOk = false;
+
+    while (millis() - t0 < 400) {
       while (serial.available()) {
         char c = serial.read();
         if (c == '\n') {
           buf[idx] = '\0';
           if (strstr(buf, "+OK") != NULL) {
-            delay(200); // 内部リセット・RF安定化待機
+            gotOk = true;
+            break;
+          }
+          idx = 0;
+        } else if (c != '\r' && idx < sizeof(buf) - 1) {
+          buf[idx++] = c;
+        }
+      }
+      if (gotOk) break;
+    }
+
+    // 内部EEPROM書き込み・RFリセット待機
+    delay(200);
+    clearSerialBuffer(serial);
+
+    // AT+MODE? で実際に反映されているか再確認
+    serial.print(F("AT+MODE?\r\n"));
+    t0 = millis();
+    idx = 0;
+    while (millis() - t0 < 300) {
+      while (serial.available()) {
+        char c = serial.read();
+        if (c == '\n') {
+          buf[idx] = '\0';
+          if (strstr(buf, modeStr) != NULL) {
+            delay(50);
             clearSerialBuffer(serial);
-            return true;
+            return true; // 確実に指定モードに遷移した
           }
           idx = 0;
         } else if (c != '\r' && idx < sizeof(buf) - 1) {
@@ -182,7 +212,7 @@ bool setModuleMode(SoftwareSerial &serial, uint8_t mode) {
 }
 
 /**
- * @brief アンカー間自動キャリブレーション処理
+ * @brief アンカー間自動キャリブレーション処理 (完全復旧保証付き)
  */
 void runAnchorCalibration() {
   if (isDebugMode) {
@@ -193,25 +223,42 @@ void runAnchorCalibration() {
   if (setModuleMode(uwbSerial2, 0)) {
     // Slave 1 から Slave 2 を測距
     long d12_meas = measureDistance(uwbSerial1, "SLAVE2", "CALIB_S1->S2", 400);
-    // Slave 2 を確実に ANCHOR モードに復旧
-    setModuleMode(uwbSerial2, 1);
+
+    // Slave 2 を確実に ANCHOR モード (1) に復旧 (成功するまで最大3回リトライ)
+    for (int k = 0; k < 3; k++) {
+      if (setModuleMode(uwbSerial2, 1)) break;
+      delay(100);
+    }
 
     if (d12_meas >= MIN_VALID_BASELINE_CM && d12_meas <= MAX_VALID_DISTANCE_CM) {
       calib_d12 = d12_meas;
     }
+  } else {
+    // 失敗時も念のため確実に復旧
+    setModuleMode(uwbSerial2, 1);
   }
 
   // --- Step 2: Slave 3 を一時的に TAG モードに切り替え ---
   if (setModuleMode(uwbSerial3, 0)) {
     // Slave 1 から Slave 3 を測距
     long d13_meas = measureDistance(uwbSerial1, "SLAVE3", "CALIB_S1->S3", 400);
-    // Slave 3 を確実に ANCHOR モードに復旧
-    setModuleMode(uwbSerial3, 1);
+
+    // Slave 3 を確実に ANCHOR モード (1) に復旧 (成功するまで最大3回リトライ)
+    for (int k = 0; k < 3; k++) {
+      if (setModuleMode(uwbSerial3, 1)) break;
+      delay(100);
+    }
 
     if (d13_meas >= MIN_VALID_BASELINE_CM && d13_meas <= MAX_VALID_DISTANCE_CM) {
       calib_d13 = d13_meas;
     }
+  } else {
+    // 失敗時も念のため確実に復旧
+    setModuleMode(uwbSerial3, 1);
   }
+
+  // キャリブレーション完了後のRF安定化待機
+  delay(250);
 
   // PCへキャリブレーション結果を出力: CALIB,d12,d13
   Serial.print(F("CALIB,"));
@@ -296,8 +343,12 @@ long measureDistance(SoftwareSerial &serial, const char *targetAddr, const char 
           if (isDebugMode) {
             Serial.print(F("["));
             Serial.print(anchorTag);
-            Serial.println(F("] -> Received ERROR response"));
+            Serial.println(F("] -> Received ERROR response. Auto-restoring MODE=1..."));
           }
+          // エラー受信時は即座に Anchor モード復旧を試行
+          serial.print(F("AT+MODE=1\r\n"));
+          delay(150);
+          clearSerialBuffer(serial);
           return -1;
         }
 
@@ -307,6 +358,26 @@ long measureDistance(SoftwareSerial &serial, const char *targetAddr, const char 
           rxBuf[bufIdx++] = c;
         }
       }
+    }
+  }
+
+  // タイムアウト時の自動自己修復 (Self-Healing):
+  // 連続3回タイムアウトした場合、バックグラウンドで MODE=1 を強制送信
+  static uint8_t s2_fail_count = 0;
+  static uint8_t s3_fail_count = 0;
+  if (strcmp(anchorTag, "S2") == 0) {
+    if (++s2_fail_count >= 3) {
+      s2_fail_count = 0;
+      serial.print(F("AT+MODE=1\r\n"));
+      delay(150);
+      clearSerialBuffer(serial);
+    }
+  } else if (strcmp(anchorTag, "S3") == 0) {
+    if (++s3_fail_count >= 3) {
+      s3_fail_count = 0;
+      serial.print(F("AT+MODE=1\r\n"));
+      delay(150);
+      clearSerialBuffer(serial);
     }
   }
 
