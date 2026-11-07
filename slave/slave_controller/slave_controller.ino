@@ -6,6 +6,9 @@
  * SoftwareSerial を用いて時分割順次ポーリングし、
  * ロボット側 Tag (Master) との距離を取得して PC へシリアル出力します。
  * 
+ * 【自動リセット機能】
+ * - 起動時に Arduino D8 から全モジュールの Pin 2 (NRST) へリセットパルスを送信し自動起動
+ * 
  * 【デバッグ機能】
  * - PCから 'd' または 'D' を送信すると、詳細デバッグログ ⇔ CSV出力 をリアルタイム切替可能
  * - 各Slaveの送受信ログ、生レスポンス、タイムアウト状態を可視化
@@ -16,23 +19,27 @@
 // ==========================================
 // デバッグ設定
 // ==========================================
-// 起動時のデバッグモード (true: 詳細ログ出力, false: 本番CSV出力)
+// 起動時のデバッグモード (false: 本番CSV出力 'DIST,d1,d2,d3', true: 詳細ログ出力)
 // ※ 実行中にシリアルモニタから 'd' を送るといつでも切替可能です
 bool isDebugMode = false;
 
 // ==========================================
 // ピン配置設定 (Arduino Uno R3)
 // ==========================================
-// ※ Arduino RX は RYUW122 TXD に直結可能 (3.3V -> 5V入力OK)
-// ※ Arduino TX は RYUW122 RXD に接続時、必ず分圧(1kΩ/2kΩ等)で3.3Vに降圧してください。
-const uint8_t SLAVE1_RX_PIN = 2; // to Slave1 TXD
-const uint8_t SLAVE1_TX_PIN = 3; // to Slave1 RXD (分圧後)
+// 全モジュール共通ハードウェアリセットピン
+const uint8_t UWB_RESET_PIN = 8; // to All Slaves Pin 2 (NRST)
 
-const uint8_t SLAVE2_RX_PIN = 4; // to Slave2 TXD
-const uint8_t SLAVE2_TX_PIN = 5; // to Slave2 RXD (分圧後)
+// Slave 1: 原点 (0, 0)
+const uint8_t SLAVE1_RX_PIN = 2; // to Slave1 Pin 4 (TXD)
+const uint8_t SLAVE1_TX_PIN = 3; // to Slave1 Pin 3 (RXD)
 
-const uint8_t SLAVE3_RX_PIN = 6; // to Slave3 TXD
-const uint8_t SLAVE3_TX_PIN = 7; // to Slave3 RXD (分圧後)
+// Slave 2: Y軸 (0, 1.0)
+const uint8_t SLAVE2_RX_PIN = 4; // to Slave2 Pin 4 (TXD)
+const uint8_t SLAVE2_TX_PIN = 5; // to Slave2 Pin 3 (RXD)
+
+// Slave 3: X軸 (1.0, 0)
+const uint8_t SLAVE3_RX_PIN = 6; // to Slave3 Pin 4 (TXD)
+const uint8_t SLAVE3_TX_PIN = 7; // to Slave3 Pin 3 (RXD)
 
 const uint8_t HEARTBEAT_LED = 13; // 動作確認用内蔵LED
 
@@ -42,17 +49,17 @@ const uint8_t HEARTBEAT_LED = 13; // 動作確認用内蔵LED
 // PCとの通信速度 (ハードウェアシリアル)
 const unsigned long PC_BAUDRATE = 115200;
 
-// RYUW122との通信速度 (SoftwareSerialのため 9600bps 推奨)
+// RYUW122との通信速度 (SoftwareSerialのため 9600bps)
 const unsigned long UWB_BAUDRATE = 9600;
 
 // 測距対象の Tag (Master) アドレス
 const char TARGET_TAG_ADDR[] = "TAG1";
 
-// 測距コマンドのタイムアウト時間 [ms] (RYUW122の標準応答時間は約50ms)
-const unsigned long RANGING_TIMEOUT_MS = 120;
+// 測距コマンドのタイムアウト時間 [ms] (標準応答時間は約60-100ms)
+const unsigned long RANGING_TIMEOUT_MS = 200;
 
 // ポート切り替え後の安定化ウェイト [ms]
-const unsigned long SWITCH_DELAY_MS = 10;
+const unsigned long SWITCH_DELAY_MS = 15;
 
 // 測定値の上限 [cm]
 const long MAX_VALID_DISTANCE_CM = 3000;
@@ -70,6 +77,7 @@ SoftwareSerial uwbSerial3(SLAVE3_RX_PIN, SLAVE3_TX_PIN);
 long measureDistance(SoftwareSerial &serial, const char *anchorTag);
 void clearSerialBuffer(SoftwareSerial &serial);
 void checkDebugCommand();
+void resetAllUwbModules();
 
 void setup() {
   pinMode(HEARTBEAT_LED, OUTPUT);
@@ -81,16 +89,26 @@ void setup() {
     ; // シリアル接続待機
   }
 
-  // 各UWB通信初期化
+  Serial.println(F("# =================================================="));
+  Serial.println(F("# SYSTEM_START: Local GPS Slave Controller v2.0    "));
+  Serial.println(F("# Hardware Auto-Reset enabled on Pin D8             "));
+  Serial.println(F("# Send 'd' or 'D' via Serial to TOGGLE DEBUG LOGS  "));
+  Serial.println(F("# =================================================="));
+
+  // 1. 全UWBモジュールのハードウェア一括リセット
+  resetAllUwbModules();
+
+  // 2. 各UWB SoftwareSerial初期化
   uwbSerial1.begin(UWB_BAUDRATE);
   uwbSerial2.begin(UWB_BAUDRATE);
   uwbSerial3.begin(UWB_BAUDRATE);
 
-  Serial.println(F("# =================================================="));
-  Serial.println(F("# SYSTEM_START: Local GPS Slave Controller v1.2    "));
-  Serial.println(F("# Send 'd' or 'D' via Serial to TOGGLE DEBUG LOGS  "));
-  Serial.println(F("# =================================================="));
-  delay(200);
+  clearSerialBuffer(uwbSerial1);
+  clearSerialBuffer(uwbSerial2);
+  clearSerialBuffer(uwbSerial3);
+
+  Serial.println(F("# [READY] All 3 Anchors Initialized & Active."));
+  delay(100);
 }
 
 void loop() {
@@ -129,6 +147,20 @@ void loop() {
     Serial.print(F(","));
     Serial.println(d3);
   }
+}
+
+/**
+ * @brief 全UWBモジュールにハードウェアリセットパルスを印加して初期化
+ */
+void resetAllUwbModules() {
+  Serial.println(F("# [INIT] Resetting UWB Anchors via D8..."));
+  pinMode(UWB_RESET_PIN, OUTPUT);
+  digitalWrite(UWB_RESET_PIN, LOW);   // Active-LOW reset
+  delay(30);                           // 30msパルス
+  digitalWrite(UWB_RESET_PIN, HIGH);
+  pinMode(UWB_RESET_PIN, INPUT_PULLUP);// オープンドレイン/プルアップ解放
+  delay(600);                          // モジュール起動・+READY出力待ち
+  Serial.println(F("# [INIT] UWB Anchors boot sequence complete."));
 }
 
 /**
@@ -188,7 +220,7 @@ long measureDistance(SoftwareSerial &serial, const char *anchorTag) {
           Serial.println(rxBuf);
         }
 
-        // 成功レスポンス: +ANCHOR_RCV=<Tag_Address>,<Length>,<Data>,<Distance_cm>
+        // 成功レスポンス: +ANCHOR_RCV=<Tag_Address>,<Length>,<Data>,<Distance_cm> cm
         if (strncmp(rxBuf, "+ANCHOR_RCV=", 12) == 0) {
           char *lastComma = strrchr(rxBuf, ',');
           if (lastComma != NULL) {

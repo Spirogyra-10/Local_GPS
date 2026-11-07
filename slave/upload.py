@@ -14,8 +14,8 @@ import serial.tools.list_ports
 
 
 SKETCHES = {
-    "config": os.path.join("slave_config_tool", "slave_config_tool.ino"),
     "controller": os.path.join("slave_controller", "slave_controller.ino"),
+    "config": os.path.join("slave_config_tool", "slave_config_tool.ino"),
     "diag": os.path.join("slave_diagnostics", "slave_diagnostics.ino"),
 }
 
@@ -66,8 +66,8 @@ def main():
     parser = argparse.ArgumentParser(description="Upload Arduino Sketch without Arduino IDE")
     parser.add_argument(
         "target",
-        choices=["config", "controller", "diag"],
-        help="Target sketch to upload: 'config', 'controller', or 'diag'",
+        choices=list(SKETCHES.keys()),
+        help=f"Target sketch to upload: {list(SKETCHES.keys())}",
     )
     parser.add_argument("--port", type=str, default=None, help="COM port (e.g. COM5)")
     args = parser.parse_args()
