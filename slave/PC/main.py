@@ -1,6 +1,7 @@
 """
 main.py
 Local GPS - UWB 自己位置推定 リアルタイム可視化 & ロギングアプリケーション
+(自動キャリブレーションフィードバック対応)
 """
 
 import argparse
@@ -26,7 +27,7 @@ class LocalGPSVisualizer:
         use_filter=True,
         history_len=60,
         log_csv=None,
-        plot_range=(-1.0, 4.0),
+        plot_range=(-0.5, 4.0),
     ):
         self.reader = reader
         self.tri = Trilateration(anchor1, anchor2, anchor3)
@@ -36,12 +37,17 @@ class LocalGPSVisualizer:
         self.csv_file = None
         self.csv_writer = None
         self.plot_range = plot_range
+        self.latest_calib = (1.0, 1.0)
+
+        # キャリブレーション受信コールバック登録
+        if hasattr(self.reader, "on_calib_received"):
+            self.reader.on_calib_received = self.on_calib_update
 
         if self.log_csv:
             self.csv_file = open(self.log_csv, "w", newline="", encoding="utf-8")
             self.csv_writer = csv.writer(self.csv_file)
             self.csv_writer.writerow(
-                ["timestamp", "d1_m", "d2_m", "d3_m", "est_x_m", "est_y_m", "mode"]
+                ["timestamp", "d1_m", "d2_m", "d3_m", "est_x_m", "est_y_m", "mode", "calib_d12", "calib_d13"]
             )
 
         # 軌跡バッファ
@@ -50,7 +56,7 @@ class LocalGPSVisualizer:
 
         # Matplotlib 設定
         self.fig, self.ax = plt.subplots(figsize=(9, 9))
-        self.fig.canvas.manager.set_window_title("Local GPS - UWB Positioning Monitor")
+        self.fig.canvas.manager.set_window_title("Local GPS - UWB Positioning Monitor (Auto-Calibrated)")
 
         # プロット要素の初期化
         self.setup_plot()
@@ -69,7 +75,7 @@ class LocalGPSVisualizer:
 
         # アンカープロット
         anchors = self.tri.anchors
-        self.ax.scatter(
+        self.anchor_scatter = self.ax.scatter(
             anchors[:, 0],
             anchors[:, 1],
             c="royalblue",
@@ -80,8 +86,9 @@ class LocalGPSVisualizer:
             linewidths=1.5,
             label="Anchors (Slaves)",
         )
+        self.anchor_texts = []
         for i, (ax_x, ax_y) in enumerate(anchors, start=1):
-            self.ax.text(
+            t = self.ax.text(
                 ax_x + 0.05,
                 ax_y + 0.05,
                 f"Slave {i} ({ax_x:.2f}, {ax_y:.2f})",
@@ -89,6 +96,7 @@ class LocalGPSVisualizer:
                 color="navy",
                 fontweight="bold",
             )
+            self.anchor_texts.append(t)
 
         # 軌跡ライン
         (self.line_traj,) = self.ax.plot(
@@ -115,7 +123,7 @@ class LocalGPSVisualizer:
             0.98,
             "Connecting...",
             transform=self.ax.transAxes,
-            fontsize=10.5,
+            fontsize=10,
             verticalalignment="top",
             fontfamily="monospace",
             bbox=dict(boxstyle="round,pad=0.5", facecolor="white", alpha=0.88, edgecolor="gray"),
@@ -124,8 +132,25 @@ class LocalGPSVisualizer:
 
         self.ax.legend(loc="lower right")
 
+    def on_calib_update(self, d12_m, d13_m):
+        """Arduino から CALIB,d12,d13 が届いた時の更新処理"""
+        self.latest_calib = (d12_m, d13_m)
+        self.tri.update_anchors(d12_m, d13_m)
+
+        anchors = self.tri.anchors
+        # プロット上のアンカー位置を更新
+        self.anchor_scatter.set_offsets(anchors)
+        self.circle1.center = tuple(anchors[0])
+        self.circle2.center = tuple(anchors[1])
+        self.circle3.center = tuple(anchors[2])
+
+        for i, (ax_x, ax_y) in enumerate(anchors):
+            self.anchor_texts[i].set_position((ax_x + 0.05, ax_y + 0.05))
+            self.anchor_texts[i].set_text(f"Slave {i+1} ({ax_x:.2f}, {ax_y:.2f})")
+
     def update_frame(self):
         d1, d2, d3 = self.reader.latest_distances
+        c12, c13 = getattr(self.reader, "latest_calib", self.latest_calib)
 
         # 三辺測量で位置推定
         pos, mode = self.tri.calculate_position(d1, d2, d3)
@@ -138,7 +163,7 @@ class LocalGPSVisualizer:
             ts = datetime.datetime.now().isoformat()
             px = f"{pos[0]:.4f}" if pos else ""
             py = f"{pos[1]:.4f}" if pos else ""
-            self.csv_writer.writerow([ts, d1, d2, d3, px, py, mode])
+            self.csv_writer.writerow([ts, d1, d2, d3, px, py, mode, c12, c13])
 
         # プロット更新
         if pos is not None:
@@ -183,7 +208,10 @@ class LocalGPSVisualizer:
             f"Slave 1 (d1): {d1_str}\n"
             f"Slave 2 (d2): {d2_str}\n"
             f"Slave 3 (d3): {d3_str}\n"
-            f"────────────────────────\n"
+            f"───────────────────────────────\n"
+            f"Calib S1-S2(Y): {c12:.2f} m\n"
+            f"Calib S1-S3(X): {c13:.2f} m\n"
+            f"───────────────────────────────\n"
         )
         if pos is not None:
             status_str += f"Robot: X={pos[0]:.3f} m, Y={pos[1]:.3f} m\nMode:  {mode}"
@@ -215,10 +243,10 @@ class LocalGPSVisualizer:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Local GPS PC Visualizer & Position Estimator")
+    parser = argparse.ArgumentParser(description="Local GPS PC Visualizer with Auto-Calibration")
     parser.add_argument("--port", type=str, default=None, help="Serial COM port (e.g. COM5)")
     parser.add_argument("--baud", type=int, default=115200, help="Baudrate (default: 115200)")
-    parser.add_argument("--spacing", type=float, default=1.0, help="Anchor spacing in meters (default: 1.0m)")
+    parser.add_argument("--spacing", type=float, default=1.0, help="Initial anchor spacing in meters (default: 1.0m)")
     parser.add_argument("--range", type=float, default=4.0, help="Plot range in meters (default: 4.0m)")
     parser.add_argument("--sim", action="store_true", help="Run simulation mode without Arduino hardware")
     parser.add_argument("--no-filter", action="store_true", help="Disable moving average filter")
@@ -227,7 +255,6 @@ def main():
 
     args = parser.parse_args()
 
-    # アンカー座標設定 (S1: 原点, S2: Y軸, S3: X軸)
     s = args.spacing
     anchor1 = (0.0, 0.0)
     anchor2 = (0.0, s)
@@ -256,7 +283,7 @@ def main():
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         log_path = os.path.join("logs", f"ranging_log_{timestamp}.csv")
 
-    rmin = -0.5 * s if s > 0 else -0.5
+    rmin = -0.5
     rmax = max(args.range, s * 1.5)
 
     app = LocalGPSVisualizer(

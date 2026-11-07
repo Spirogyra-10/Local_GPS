@@ -31,6 +31,23 @@ class Trilateration:
         """
         self.anchors = np.array([anchor1, anchor2, anchor3], dtype=float)
 
+    def update_anchors(self, d12: float, d13: float):
+        """自動キャリブレーションで得られた実測基準線長からアンカー座標を動的に更新する
+        
+        Parameters
+        ----------
+        d12 : float
+            Slave 1 から Slave 2 までの実測距離 [m] (Y軸アンカー)
+        d13 : float
+            Slave 1 から Slave 3 までの実測距離 [m] (X軸アンカー)
+        """
+        if d12 > 0 and d13 > 0:
+            self.anchors = np.array([
+                (0.0, 0.0),
+                (0.0, float(d12)),
+                (float(d13), 0.0),
+            ], dtype=float)
+
     def calculate_position(
         self, d1: float, d2: float, d3: float, allow_fallback: bool = True
     ) -> Tuple[Optional[Tuple[float, float]], str]:

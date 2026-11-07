@@ -29,6 +29,9 @@ class SerialReader:
         on_data_received: Optional[
             Callable[[float, float, float], None]
         ] = None,
+        on_calib_received: Optional[
+            Callable[[float, float], None]
+        ] = None,
     ):
         """シリアル受信スレッドの初期化
 
@@ -40,16 +43,20 @@ class SerialReader:
             Arduino との通信速度 (デフォルト: 115200)
         on_data_received : Optional[Callable[[float, float, float], None]]
             距離データ受信時のコールバック
+        on_calib_received : Optional[Callable[[float, float], None]]
+            自動キャリブレーションデータ受信時のコールバック (d12_m, d13_m)
         """
         self.port = port
         self.baudrate = baudrate
         self.on_data_received = on_data_received
+        self.on_calib_received = on_calib_received
 
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self._serial: Optional[serial.Serial] = None
 
         self.latest_distances: Tuple[float, float, float] = (-1.0, -1.0, -1.0)
+        self.latest_calib: Tuple[float, float] = (1.0, 1.0)
         self._lock = threading.Lock()
         self.is_connected = False
 
@@ -127,6 +134,24 @@ class SerialReader:
                                 if self.on_data_received:
                                     self.on_data_received(d1_m, d2_m, d3_m)
 
+                            except ValueError:
+                                pass
+                    elif line.startswith("CALIB,"):
+                        # フォーマット: CALIB,d12,d13 (単位: cm)
+                        parts = line.split(",")
+                        if len(parts) >= 3:
+                            try:
+                                d12_cm = float(parts[1])
+                                d13_cm = float(parts[2])
+                                d12_m = d12_cm / 100.0 if d12_cm > 0 else 1.0
+                                d13_m = d13_cm / 100.0 if d13_cm > 0 else 1.0
+
+                                with self._lock:
+                                    self.latest_calib = (d12_m, d13_m)
+
+                                print(f"[SerialReader] Auto-Calibration Received: S1-S2={d12_m:.2f}m, S1-S3={d13_m:.2f}m")
+                                if self.on_calib_received:
+                                    self.on_calib_received(d12_m, d13_m)
                             except ValueError:
                                 pass
                     elif line.startswith("#"):
