@@ -37,6 +37,7 @@ const char TARGET_TAG_ADDR[] = "TAG1";
 const unsigned long DEFAULT_RANGING_TIMEOUT_MS = 300;
 const unsigned long SWITCH_DELAY_MS = 25;
 const unsigned long CALIBRATION_INTERVAL_MS = 5000;
+const long MIN_VALID_BASELINE_CM = 10;
 const long MAX_VALID_DISTANCE_CM = 3000;
 
 // ==========================================
@@ -113,9 +114,9 @@ void loop() {
 
   // 2. ロボット側 Tag (Master) の測距
   long d1 = measureDistance(uwbSerial1, TARGET_TAG_ADDR, "S1");
-  delay(30);
+  delay(20);
   long d2 = measureDistance(uwbSerial2, TARGET_TAG_ADDR, "S2");
-  delay(30);
+  delay(20);
   long d3 = measureDistance(uwbSerial3, TARGET_TAG_ADDR, "S3");
 
   // 3. データ出力
@@ -195,7 +196,7 @@ void runAnchorCalibration() {
     // Slave 2 を確実に ANCHOR モードに復旧
     setModuleMode(uwbSerial2, 1);
 
-    if (d12_meas > 0 && d12_meas <= MAX_VALID_DISTANCE_CM) {
+    if (d12_meas >= MIN_VALID_BASELINE_CM && d12_meas <= MAX_VALID_DISTANCE_CM) {
       calib_d12 = d12_meas;
     }
   }
@@ -207,7 +208,7 @@ void runAnchorCalibration() {
     // Slave 3 を確実に ANCHOR モードに復旧
     setModuleMode(uwbSerial3, 1);
 
-    if (d13_meas > 0 && d13_meas <= MAX_VALID_DISTANCE_CM) {
+    if (d13_meas >= MIN_VALID_BASELINE_CM && d13_meas <= MAX_VALID_DISTANCE_CM) {
       calib_d13 = d13_meas;
     }
   }

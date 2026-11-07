@@ -9,11 +9,15 @@ import csv
 import datetime
 import os
 import sys
+
+# 自ディレクトリをモジュール検索パスに追加 (どこから起動しても安全にインポート可能)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 import matplotlib.pyplot as plt
 from matplotlib.patches import Circle
 import numpy as np
 
-from trilateration import MovingAverageFilter, Trilateration
+from trilateration import DistanceFilter, MovingAverageFilter, Trilateration
 from serial_reader import DummySerialReader, SerialReader, list_available_ports
 
 
@@ -31,6 +35,7 @@ class LocalGPSVisualizer:
     ):
         self.reader = reader
         self.tri = Trilateration(anchor1, anchor2, anchor3)
+        self.dist_filter = DistanceFilter(alpha=0.35) if use_filter else None
         self.filter = MovingAverageFilter(window_size=5) if use_filter else None
         self.history_len = history_len
         self.log_csv = log_csv
@@ -152,9 +157,16 @@ class LocalGPSVisualizer:
         d1, d2, d3 = self.reader.latest_distances
         c12, c13 = getattr(self.reader, "latest_calib", self.latest_calib)
 
-        # 三辺測量で位置推定
-        pos, mode = self.tri.calculate_position(d1, d2, d3)
+        # 1. 測距値ドメインでの平滑化 (UWBジッター除去 & 外れ値リジェクション)
+        if self.dist_filter:
+            fd1, fd2, fd3 = self.dist_filter.update(d1, d2, d3)
+        else:
+            fd1, fd2, fd3 = d1, d2, d3
 
+        # 2. 三辺測量で位置推定 (ロバスト非線形最小二乗解)
+        pos, mode = self.tri.calculate_position(fd1, fd2, fd3)
+
+        # 3. 座標ドメインでの平滑化 (移動平均)
         if pos is not None and self.filter:
             pos = self.filter.update(pos)
 
