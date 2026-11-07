@@ -191,8 +191,13 @@ class DummySerialReader:
         self._running = False
         self._thread = None
         self.latest_distances = (-1.0, -1.0, -1.0)
+        self.latest_calib = (1.0, 1.0)
         self._lock = threading.Lock()
         self.is_connected = True
+
+    def write(self, data: bytes):
+        """シミュレーション時のダミー書き込み"""
+        pass
 
     def start(self):
         self._running = True

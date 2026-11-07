@@ -28,13 +28,23 @@ class LocalGPSVisualizer:
         anchor1=(0.0, 0.0),
         anchor2=(0.0, 1.0),
         anchor3=(1.0, 0.0),
+        nominal_d12=1.0,
+        nominal_d13=1.0,
+        relabel_mode="auto",
         use_filter=True,
         history_len=60,
         log_csv=None,
         plot_range=(-0.5, 4.0),
     ):
         self.reader = reader
-        self.tri = Trilateration(anchor1, anchor2, anchor3)
+        self.tri = Trilateration(
+            anchor1=anchor1,
+            anchor2=anchor2,
+            anchor3=anchor3,
+            nominal_d12=nominal_d12,
+            nominal_d13=nominal_d13,
+            relabel_mode=relabel_mode,
+        )
         self.dist_filter = DistanceFilter(alpha=0.35) if use_filter else None
         self.filter = MovingAverageFilter(window_size=5) if use_filter else None
         self.history_len = history_len
@@ -42,7 +52,7 @@ class LocalGPSVisualizer:
         self.csv_file = None
         self.csv_writer = None
         self.plot_range = plot_range
-        self.latest_calib = (1.0, 1.0)
+        self.latest_calib = (anchor2[1], anchor3[0])
 
         # キャリブレーション受信コールバック登録
         if hasattr(self.reader, "on_calib_received"):
@@ -52,7 +62,21 @@ class LocalGPSVisualizer:
             self.csv_file = open(self.log_csv, "w", newline="", encoding="utf-8")
             self.csv_writer = csv.writer(self.csv_file)
             self.csv_writer.writerow(
-                ["timestamp", "d1_m", "d2_m", "d3_m", "est_x_m", "est_y_m", "mode", "calib_d12", "calib_d13"]
+                [
+                    "timestamp",
+                    "raw_d1",
+                    "raw_d2",
+                    "raw_d3",
+                    "d1_m",
+                    "d2_m",
+                    "d3_m",
+                    "est_x_m",
+                    "est_y_m",
+                    "mode",
+                    "calib_d12",
+                    "calib_d13",
+                    "relabel",
+                ]
             )
 
         # 軌跡バッファ
@@ -61,7 +85,7 @@ class LocalGPSVisualizer:
 
         # Matplotlib 設定
         self.fig, self.ax = plt.subplots(figsize=(9, 9))
-        self.fig.canvas.manager.set_window_title("Local GPS - UWB Positioning Monitor (Auto-Calibrated)")
+        self.fig.canvas.manager.set_window_title("Local GPS - UWB Positioning Monitor (Auto-Relabeled)")
 
         # プロット要素の初期化
         self.setup_plot()
@@ -72,6 +96,24 @@ class LocalGPSVisualizer:
             if hasattr(self.reader, "write"):
                 self.reader.write(b"c\n")
                 print("\n[GUI] 'C' key pressed -> Sent re-calibration request to Arduino.")
+        elif event.key in ("r", "R"):
+            # 手動リラベル切り替え (Toggle Swapped)
+            self.tri.is_swapped = not self.tri.is_swapped
+            self.tri.relabel_mode = "swap" if self.tri.is_swapped else "normal"
+            if hasattr(self, "latest_calib"):
+                self.tri.update_anchors(*self.latest_calib)
+            else:
+                self.tri.d12, self.tri.d13 = self.tri.d13, self.tri.d12
+                self.tri.anchors = np.array([
+                    (0.0, 0.0),
+                    (0.0, self.tri.d12),
+                    (self.tri.d13, 0.0),
+                ], dtype=float)
+            if self.dist_filter:
+                self.dist_filter.reset()
+            self.on_calib_update(*getattr(self, "latest_calib", (self.tri.d12, self.tri.d13)))
+            state_str = "SWAPPED (Port 3->S2, Port 2->S3)" if self.tri.is_swapped else "NORMAL (Port 2->S2, Port 3->S3)"
+            print(f"\n[GUI] 'R' key pressed -> Manual mapping toggle: {state_str}")
 
     def setup_plot(self):
         self.ax.set_title("Realtime 2D Robot Position (UWB Trilateration)", fontsize=14, fontweight="bold")
@@ -99,11 +141,18 @@ class LocalGPSVisualizer:
             label="Anchors (Slaves)",
         )
         self.anchor_texts = []
-        for i, (ax_x, ax_y) in enumerate(anchors, start=1):
+        p2_port = "P3" if self.tri.is_swapped else "P2"
+        p3_port = "P2" if self.tri.is_swapped else "P3"
+        labels = [
+            f"Slave 1 (0.00, 0.00)",
+            f"Slave 2 [{p2_port}] ({anchors[1][0]:.2f}, {anchors[1][1]:.2f})",
+            f"Slave 3 [{p3_port}] ({anchors[2][0]:.2f}, {anchors[2][1]:.2f})",
+        ]
+        for i, (ax_x, ax_y) in enumerate(anchors):
             t = self.ax.text(
                 ax_x + 0.05,
                 ax_y + 0.05,
-                f"Slave {i} ({ax_x:.2f}, {ax_y:.2f})",
+                labels[i],
                 fontsize=10,
                 color="navy",
                 fontweight="bold",
@@ -145,9 +194,15 @@ class LocalGPSVisualizer:
         self.ax.legend(loc="lower right")
 
     def on_calib_update(self, d12_m, d13_m):
-        """Arduino から CALIB,d12,d13 が届いた時の更新処理"""
+        """Arduino から CALIB,d12,d13 が届いた時の更新処理 (自動リラベル照合付き)"""
         self.latest_calib = (d12_m, d13_m)
-        self.tri.update_anchors(d12_m, d13_m)
+        swapped_changed = self.tri.update_anchors(d12_m, d13_m)
+
+        if swapped_changed:
+            if self.dist_filter:
+                self.dist_filter.reset()
+            state_str = "SWAPPED (Relabeled: Port 3->S2, Port 2->S3)" if self.tri.is_swapped else "NORMAL (Port 2->S2, Port 3->S3)"
+            print(f"\n[Auto-Relabel] Mapping updated -> {state_str}")
 
         anchors = self.tri.anchors
         # プロット上のアンカー位置を更新
@@ -156,13 +211,20 @@ class LocalGPSVisualizer:
         self.circle2.center = tuple(anchors[1])
         self.circle3.center = tuple(anchors[2])
 
-        for i, (ax_x, ax_y) in enumerate(anchors):
-            self.anchor_texts[i].set_position((ax_x + 0.05, ax_y + 0.05))
-            self.anchor_texts[i].set_text(f"Slave {i+1} ({ax_x:.2f}, {ax_y:.2f})")
+        p2_port = "P3" if self.tri.is_swapped else "P2"
+        p3_port = "P2" if self.tri.is_swapped else "P3"
+        self.anchor_texts[0].set_text(f"Slave 1 ({anchors[0][0]:.2f}, {anchors[0][1]:.2f})")
+        self.anchor_texts[1].set_position((anchors[1][0] + 0.05, anchors[1][1] + 0.05))
+        self.anchor_texts[1].set_text(f"Slave 2 [{p2_port}] ({anchors[1][0]:.2f}, {anchors[1][1]:.2f})")
+        self.anchor_texts[2].set_position((anchors[2][0] + 0.05, anchors[2][1] + 0.05))
+        self.anchor_texts[2].set_text(f"Slave 3 [{p3_port}] ({anchors[2][0]:.2f}, {anchors[2][1]:.2f})")
 
     def update_frame(self):
-        d1, d2, d3 = self.reader.latest_distances
+        raw_d1, raw_d2, raw_d3 = self.reader.latest_distances
         c12, c13 = getattr(self.reader, "latest_calib", self.latest_calib)
+
+        # 0. 物理ポート -> 論理アンカーのリラベル適用 (入れ替え設置の自動補正)
+        d1, d2, d3 = self.tri.remap_distances(raw_d1, raw_d2, raw_d3)
 
         # 1. 測距値ドメインでの平滑化 (UWBジッター除去 & 外れ値リジェクション)
         if self.dist_filter:
@@ -182,7 +244,10 @@ class LocalGPSVisualizer:
             ts = datetime.datetime.now().isoformat()
             px = f"{pos[0]:.4f}" if pos else ""
             py = f"{pos[1]:.4f}" if pos else ""
-            self.csv_writer.writerow([ts, d1, d2, d3, px, py, mode, c12, c13])
+            relabel_flag = "SWAPPED" if self.tri.is_swapped else "NORMAL"
+            self.csv_writer.writerow(
+                [ts, raw_d1, raw_d2, raw_d3, d1, d2, d3, px, py, mode, c12, c13, relabel_flag]
+            )
 
         # プロット更新
         if pos is not None:
@@ -222,15 +287,20 @@ class LocalGPSVisualizer:
         d2_str = f"{d2:5.2f} m" if d2 > 0 else "  LOST  "
         d3_str = f"{d3:5.2f} m" if d3 > 0 else "  LOST  "
 
+        p2_port = "Port 3" if self.tri.is_swapped else "Port 2"
+        p3_port = "Port 2" if self.tri.is_swapped else "Port 3"
+        relabel_desc = "RELABELED (P3->S2, P2->S3)" if self.tri.is_swapped else "NORMAL (P2->S2, P3->S3)"
+
         status_str = (
             f"[LINK] {conn_str}\n"
             f"Slave 1 (d1): {d1_str}\n"
-            f"Slave 2 (d2): {d2_str}\n"
-            f"Slave 3 (d3): {d3_str}\n"
+            f"Slave 2 [{p2_port}]: {d2_str}\n"
+            f"Slave 3 [{p3_port}]: {d3_str}\n"
             f"───────────────────────────────\n"
-            f"Calib S1-S2(Y): {c12:.2f} m\n"
-            f"Calib S1-S3(X): {c13:.2f} m\n"
-            f"[Press 'C' to Re-Calibrate]\n"
+            f"Mapping: {relabel_desc}\n"
+            f"Calib S2(Y): {self.tri.d12:.2f} m (Nom: {self.tri.nominal_d12:.2f}m)\n"
+            f"Calib S3(X): {self.tri.d13:.2f} m (Nom: {self.tri.nominal_d13:.2f}m)\n"
+            f"[C] Re-Calib | [R] Toggle Swap\n"
             f"───────────────────────────────\n"
         )
         if pos is not None:
@@ -263,10 +333,18 @@ class LocalGPSVisualizer:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Local GPS PC Visualizer with Auto-Calibration")
+    parser = argparse.ArgumentParser(description="Local GPS PC Visualizer with Auto-Calibration & Dynamic Relabeling")
     parser.add_argument("--port", type=str, default=None, help="Serial COM port (e.g. COM5)")
     parser.add_argument("--baud", type=int, default=115200, help="Baudrate (default: 115200)")
-    parser.add_argument("--spacing", type=float, default=1.0, help="Initial anchor spacing in meters (default: 1.0m)")
+    parser.add_argument("--spacing", type=float, default=1.0, help="Default anchor spacing in meters (default: 1.0m)")
+    parser.add_argument("--spacing-y", type=float, default=None, help="Nominal Y-axis (Slave 2) spacing in meters")
+    parser.add_argument("--spacing-x", type=float, default=None, help="Nominal X-axis (Slave 3) spacing in meters")
+    parser.add_argument(
+        "--relabel",
+        choices=["auto", "normal", "swap"],
+        default="auto",
+        help="Relabeling mode: auto (match with nominal), normal (Port2=S2, Port3=S3), swap (Port3=S2, Port2=S3)",
+    )
     parser.add_argument("--range", type=float, default=4.0, help="Plot range in meters (default: 4.0m)")
     parser.add_argument("--sim", action="store_true", help="Run simulation mode without Arduino hardware")
     parser.add_argument("--no-filter", action="store_true", help="Disable moving average filter")
@@ -275,10 +353,11 @@ def main():
 
     args = parser.parse_args()
 
-    s = args.spacing
+    sy = args.spacing_y if args.spacing_y is not None else args.spacing
+    sx = args.spacing_x if args.spacing_x is not None else args.spacing
     anchor1 = (0.0, 0.0)
-    anchor2 = (0.0, s)
-    anchor3 = (s, 0.0)
+    anchor2 = (0.0, sy)
+    anchor3 = (sx, 0.0)
 
     if args.sim:
         print("[Mode] Running in SIMULATION mode.")
@@ -304,13 +383,16 @@ def main():
         log_path = os.path.join("logs", f"ranging_log_{timestamp}.csv")
 
     rmin = -0.5
-    rmax = max(args.range, s * 1.5)
+    rmax = max(args.range, max(sy, sx) * 1.5)
 
     app = LocalGPSVisualizer(
         reader=reader,
         anchor1=anchor1,
         anchor2=anchor2,
         anchor3=anchor3,
+        nominal_d12=sy,
+        nominal_d13=sx,
+        relabel_mode=args.relabel,
         use_filter=not args.no_filter,
         history_len=args.history,
         log_csv=log_path,

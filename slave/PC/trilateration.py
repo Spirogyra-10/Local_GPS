@@ -24,37 +24,94 @@ class Trilateration:
         anchor1: Tuple[float, float] = (0.0, 0.0),
         anchor2: Tuple[float, float] = (0.0, 1.0),
         anchor3: Tuple[float, float] = (1.0, 0.0),
+        nominal_d12: Optional[float] = None,
+        nominal_d13: Optional[float] = None,
+        relabel_mode: str = "auto",
     ):
         """三辺測量計算クラスの初期化
 
         Parameters
         ----------
         anchor1 : Tuple[float, float]
-            Slave 1 の (x, y) 座標 [m] (デフォルト: 原点 (0.0, 0.0))
+            Slave 1 の (x, y) 座標 [m] (原点 (0.0, 0.0))
         anchor2 : Tuple[float, float]
-            Slave 2 の (x, y) 座標 [m] (デフォルト: Y軸上 (0.0, 1.0))
+            Slave 2 の初期 (x, y) 座標 [m] (Y軸上 (0.0, d12))
         anchor3 : Tuple[float, float]
-            Slave 3 の (x, y) 座標 [m] (デフォルト: X軸上 (1.0, 0.0))
+            Slave 3 の初期 (x, y) 座標 [m] (X軸上 (d13, 0.0))
+        nominal_d12 : Optional[float]
+            Slave 2 (Y軸) の想定配置距離 [m] (None の場合は anchor2[1] を使用)
+        nominal_d13 : Optional[float]
+            Slave 3 (X軸) の想定配置距離 [m] (None の場合は anchor3[0] を使用)
+        relabel_mode : str
+            リラベルモード: "auto" (想定距離との照合で自動判定), "normal" (固定通常), "swap" (強制入れ替え)
         """
-        self.anchors = np.array([anchor1, anchor2, anchor3], dtype=float)
+        self.nominal_d12 = float(nominal_d12 if nominal_d12 is not None else anchor2[1])
+        self.nominal_d13 = float(nominal_d13 if nominal_d13 is not None else anchor3[0])
+        self.relabel_mode = relabel_mode
+        self.is_swapped = (relabel_mode == "swap")
 
-    def update_anchors(self, d12: float, d13: float):
-        """自動キャリブレーションで得られた実測基準線長からアンカー座標を動的に更新する
+        self.d12 = float(anchor2[1]) if anchor2[1] > 0 else self.nominal_d12
+        self.d13 = float(anchor3[0]) if anchor3[0] > 0 else self.nominal_d13
+
+        self.anchors = np.array([anchor1, (0.0, self.d12), (self.d13, 0.0)], dtype=float)
+
+    def update_anchors(self, raw_d12: float, raw_d13: float) -> bool:
+        """自動キャリブレーションで得られた実測基準線長からアンカー座標を動的に更新する。
+        事前設定された想定距離 (nominal_d12, nominal_d13) との残差を評価し、
+        物理モジュールが入れ替わって設置されていた場合は自動的にリラベルする。
 
         Parameters
         ----------
-        d12 : float
-            Slave 1 から Slave 2 までの実測距離 [m] (Y軸アンカー)
-        d13 : float
-            Slave 1 から Slave 3 までの実測距離 [m] (X軸アンカー)
+        raw_d12 : float
+            Arduino Port 2 (D4/D5) モジュールへの実測距離 [m]
+        raw_d13 : float
+            Arduino Port 3 (D6/D7) モジュールへの実測距離 [m]
+
+        Returns
+        -------
+        bool
+            リラベル状態 (is_swapped) が切り替わった場合 True
         """
-        # 極端な近接飽和ノイズ (10cm未満) や異常値を排除
-        if d12 >= 0.10 and d13 >= 0.10:
-            self.anchors = np.array([
-                (0.0, 0.0),
-                (0.0, float(d12)),
-                (float(d13), 0.0),
-            ], dtype=float)
+        if raw_d12 < 0.10 or raw_d13 < 0.10:
+            return False
+
+        old_swapped = self.is_swapped
+
+        if self.relabel_mode == "auto":
+            # 想定配置 (P2->Y軸, P3->X軸) と 入れ替え配置 (P3->Y軸, P2->X軸) の誤差比較
+            cost_normal = abs(raw_d12 - self.nominal_d12) + abs(raw_d13 - self.nominal_d13)
+            cost_swapped = abs(raw_d13 - self.nominal_d12) + abs(raw_d12 - self.nominal_d13)
+
+            # 入れ替え配置の方が想定に明らかに適合している場合 (しきい値マージン 1cm)
+            if cost_swapped < cost_normal - 0.01:
+                self.is_swapped = True
+            elif cost_normal < cost_swapped - 0.01:
+                self.is_swapped = False
+        elif self.relabel_mode == "swap":
+            self.is_swapped = True
+        else:
+            self.is_swapped = False
+
+        if self.is_swapped:
+            self.d12 = float(raw_d13)  # Port 3 の距離を Y軸 (Slave 2) に割り当て
+            self.d13 = float(raw_d12)  # Port 2 の距離を X軸 (Slave 3) に割り当て
+        else:
+            self.d12 = float(raw_d12)  # Port 2 の距離を Y軸 (Slave 2) に割り当て
+            self.d13 = float(raw_d13)  # Port 3 の距離を X軸 (Slave 3) に割り当て
+
+        self.anchors = np.array([
+            (0.0, 0.0),
+            (0.0, self.d12),
+            (self.d13, 0.0),
+        ], dtype=float)
+
+        return self.is_swapped != old_swapped
+
+    def remap_distances(self, raw_d1: float, raw_d2: float, raw_d3: float) -> Tuple[float, float, float]:
+        """リラベル状態に応じて、測定距離を論理アンカー (S1, S2, S3) の順序に並べ替える"""
+        if self.is_swapped:
+            return raw_d1, raw_d3, raw_d2
+        return raw_d1, raw_d2, raw_d3
 
     def calculate_position(
         self, d1: float, d2: float, d3: float, allow_fallback: bool = True
@@ -328,5 +385,29 @@ if __name__ == "__main__":
     print(f"Fallback 1-3 Test: pos={p2_13}, mode={mode2_13}")
     assert p2_13 is not None and mode2_13 == "FALLBACK_13"
     assert abs(p2_13[0] - 0.5) < 1e-2 and abs(p2_13[1] - 0.5) < 1e-2
+
+    # 4. 動的リラベルテスト (Slave2とSlave3が物理的に入れ替わって置かれた場合)
+    tri_relabel = Trilateration(nominal_d12=0.8, nominal_d13=1.5)
+    # 物理ポート3がY軸位置(0.8m)、物理ポート2がX軸位置(1.5m)に置かれた場合のCALIB測定
+    swapped = tri_relabel.update_anchors(raw_d12=1.5, raw_d13=0.8)
+    print(f"Auto-Relabel Test: is_swapped={tri_relabel.is_swapped}, changed={swapped}")
+    assert tri_relabel.is_swapped is True
+    assert abs(tri_relabel.d12 - 0.8) < 1e-3 and abs(tri_relabel.d13 - 1.5) < 1e-3
+
+    # ロボットが (0.5, 0.5) にある時:
+    # d1 = sqrt(0.5^2 + 0.5^2) ~= 0.7071
+    # Y軸(S2)からの距離 = sqrt(0.5^2 + (0.5-0.8)^2) = sqrt(0.25 + 0.09) = sqrt(0.34) ~= 0.5831
+    # X軸(S3)からの距離 = sqrt((0.5-1.5)^2 + 0.5^2) = sqrt(1.0 + 0.25) = sqrt(1.25) ~= 1.1180
+    # 物理ポート2がX軸にあり、物理ポート3がY軸にあるため、Arduinoから届く生データは:
+    raw_d1 = math.hypot(0.5, 0.5)
+    raw_d2 = math.hypot(0.5 - 1.5, 0.5)  # 物理ポート2 (X軸位置にある)
+    raw_d3 = math.hypot(0.5, 0.5 - 0.8)  # 物理ポート3 (Y軸位置にある)
+
+    # リラベルを適用して距離を再配置
+    rem_d1, rem_d2, rem_d3 = tri_relabel.remap_distances(raw_d1, raw_d2, raw_d3)
+    pos_rel, mode_rel = tri_relabel.calculate_position(rem_d1, rem_d2, rem_d3)
+    print(f"Relabeled Position Test: pos={pos_rel}, mode={mode_rel}")
+    assert pos_rel is not None
+    assert abs(pos_rel[0] - 0.5) < 1e-2 and abs(pos_rel[1] - 0.5) < 1e-2
 
     print("All Trilateration tests passed!")
