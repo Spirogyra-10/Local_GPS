@@ -7,6 +7,7 @@ Local GPS - UWB 自己位置推定 リアルタイム可視化 & ロギングア
 import argparse
 import csv
 import datetime
+import math
 import os
 import sys
 
@@ -17,7 +18,7 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Circle
 import numpy as np
 
-from trilateration import DistanceFilter, MovingAverageFilter, Trilateration
+from trilateration import DistanceFilter, KinematicPositionFilter, MovingAverageFilter, Trilateration
 from serial_reader import DummySerialReader, SerialReader, list_available_ports
 
 
@@ -32,6 +33,8 @@ class LocalGPSVisualizer:
         nominal_d13=1.0,
         relabel_mode="auto",
         use_filter=True,
+        max_speed=1.5,
+        use_kinematic=True,
         history_len=60,
         log_csv=None,
         plot_range=(-0.5, 4.0),
@@ -46,13 +49,19 @@ class LocalGPSVisualizer:
             relabel_mode=relabel_mode,
         )
         self.dist_filter = DistanceFilter(alpha=0.35) if use_filter else None
-        self.filter = MovingAverageFilter(window_size=5) if use_filter else None
+        self.kinematic_filter = (
+            KinematicPositionFilter(max_speed_mps=max_speed) if (use_filter and use_kinematic) else None
+        )
+        self.filter = MovingAverageFilter(window_size=5) if (use_filter and not use_kinematic) else None
         self.history_len = history_len
         self.log_csv = log_csv
         self.csv_file = None
         self.csv_writer = None
         self.plot_range = plot_range
         self.latest_calib = (anchor2[1], anchor3[0])
+        self.latest_speed = 0.0
+        self.latest_heading = 0.0
+        self.latest_vel = (0.0, 0.0)
 
         # キャリブレーション受信コールバック登録
         if hasattr(self.reader, "on_calib_received"):
@@ -72,10 +81,15 @@ class LocalGPSVisualizer:
                     "d3_m",
                     "est_x_m",
                     "est_y_m",
+                    "vx_mps",
+                    "vy_mps",
+                    "speed_mps",
+                    "heading_deg",
                     "mode",
                     "calib_d12",
                     "calib_d13",
                     "relabel",
+                    "warp_blocked",
                 ]
             )
 
@@ -85,7 +99,7 @@ class LocalGPSVisualizer:
 
         # Matplotlib 設定
         self.fig, self.ax = plt.subplots(figsize=(9, 9))
-        self.fig.canvas.manager.set_window_title("Local GPS - UWB Positioning Monitor (Auto-Relabeled)")
+        self.fig.canvas.manager.set_window_title("Local GPS - UWB Positioning Monitor (Auto-Relabeled & Kinematic)")
 
         # プロット要素の初期化
         self.setup_plot()
@@ -111,12 +125,14 @@ class LocalGPSVisualizer:
                 ], dtype=float)
             if self.dist_filter:
                 self.dist_filter.reset()
+            if self.kinematic_filter:
+                self.kinematic_filter.reset()
             self.on_calib_update(*getattr(self, "latest_calib", (self.tri.d12, self.tri.d13)))
             state_str = "SWAPPED (Port 3->S2, Port 2->S3)" if self.tri.is_swapped else "NORMAL (Port 2->S2, Port 3->S3)"
             print(f"\n[GUI] 'R' key pressed -> Manual mapping toggle: {state_str}")
 
     def setup_plot(self):
-        self.ax.set_title("Realtime 2D Robot Position (UWB Trilateration)", fontsize=14, fontweight="bold")
+        self.ax.set_title("Realtime 2D Robot Position (UWB Trilateration + Kinematics)", fontsize=13, fontweight="bold")
         self.ax.set_xlabel("X [m]", fontsize=12)
         self.ax.set_ylabel("Y [m]", fontsize=12)
         self.ax.grid(True, linestyle="--", alpha=0.5)
@@ -170,6 +186,21 @@ class LocalGPSVisualizer:
             markeredgewidth=2.0, zorder=6, label="Robot (Tag)"
         )
 
+        # 進行方向・速度ベクトル矢印 (Robot Heading Vector)
+        self.heading_quiver = self.ax.quiver(
+            [0], [0], [0], [0],
+            angles="xy",
+            scale_units="xy",
+            scale=1.0,
+            color="darkgreen",
+            width=0.007,
+            headwidth=4.5,
+            headlength=5.5,
+            headaxislength=4.5,
+            zorder=7,
+            label="Heading Vector",
+        )
+
         # 測距円 (各アンカーからの円)
         self.circle1 = Circle(anchors[0], 0, fill=False, color="crimson", linestyle=":", linewidth=1.2, alpha=0.5)
         self.circle2 = Circle(anchors[1], 0, fill=False, color="darkorange", linestyle=":", linewidth=1.2, alpha=0.5)
@@ -201,6 +232,8 @@ class LocalGPSVisualizer:
         if swapped_changed:
             if self.dist_filter:
                 self.dist_filter.reset()
+            if self.kinematic_filter:
+                self.kinematic_filter.reset()
             state_str = "SWAPPED (Relabeled: Port 3->S2, Port 2->S3)" if self.tri.is_swapped else "NORMAL (Port 2->S2, Port 3->S3)"
             print(f"\n[Auto-Relabel] Mapping updated -> {state_str}")
 
@@ -233,11 +266,30 @@ class LocalGPSVisualizer:
             fd1, fd2, fd3 = d1, d2, d3
 
         # 2. 三辺測量で位置推定 (ロバスト非線形最小二乗解)
-        pos, mode = self.tri.calculate_position(fd1, fd2, fd3)
+        raw_pos, mode = self.tri.calculate_position(fd1, fd2, fd3)
 
-        # 3. 座標ドメインでの平滑化 (移動平均)
-        if pos is not None and self.filter:
-            pos = self.filter.update(pos)
+        # 3. 物理運動モデルフィルタ (速度上限制約 + 進行方向ベクトル推定)
+        vx, vy = 0.0, 0.0
+        speed = 0.0
+        heading = 0.0
+        is_clamped = False
+
+        if raw_pos is not None:
+            if self.kinematic_filter:
+                pos, (vx, vy), speed, heading = self.kinematic_filter.update(raw_pos)
+                is_clamped = self.kinematic_filter.is_clamped_last
+            elif self.filter:
+                pos = self.filter.update(raw_pos)
+            else:
+                pos = raw_pos
+        else:
+            pos = None
+            if self.kinematic_filter:
+                self.kinematic_filter.update(None)
+
+        self.latest_speed = speed
+        self.latest_heading = heading
+        self.latest_vel = (vx, vy)
 
         # CSV ロギング
         if self.csv_writer:
@@ -245,8 +297,28 @@ class LocalGPSVisualizer:
             px = f"{pos[0]:.4f}" if pos else ""
             py = f"{pos[1]:.4f}" if pos else ""
             relabel_flag = "SWAPPED" if self.tri.is_swapped else "NORMAL"
+            clamped_flag = "WARP_BLOCKED" if is_clamped else "NORMAL"
             self.csv_writer.writerow(
-                [ts, raw_d1, raw_d2, raw_d3, d1, d2, d3, px, py, mode, c12, c13, relabel_flag]
+                [
+                    ts,
+                    raw_d1,
+                    raw_d2,
+                    raw_d3,
+                    d1,
+                    d2,
+                    d3,
+                    px,
+                    py,
+                    f"{vx:.3f}",
+                    f"{vy:.3f}",
+                    f"{speed:.3f}",
+                    f"{heading:.1f}",
+                    mode,
+                    c12,
+                    c13,
+                    relabel_flag,
+                    clamped_flag,
+                ]
             )
 
         # プロット更新
@@ -259,8 +331,21 @@ class LocalGPSVisualizer:
 
             self.line_traj.set_data(self.trajectory_x, self.trajectory_y)
             self.scatter_robot.set_data([pos[0]], [pos[1]])
+
+            # 進行方向・速度ベクトルの描画更新
+            if speed > 0.08:
+                arrow_len = min(0.65, max(0.20, speed * 0.45))
+                norm_v = math.hypot(vx, vy)
+                ux = (vx / norm_v) * arrow_len
+                uy = (vy / norm_v) * arrow_len
+                self.heading_quiver.set_offsets([[pos[0], pos[1]]])
+                self.heading_quiver.set_UVC([ux], [uy])
+                self.heading_quiver.set_visible(True)
+            else:
+                self.heading_quiver.set_visible(False)
         else:
             self.scatter_robot.set_data([], [])
+            self.heading_quiver.set_visible(False)
 
         # 測距円の更新
         if d1 > 0:
@@ -291,6 +376,11 @@ class LocalGPSVisualizer:
         p3_port = "Port 2" if self.tri.is_swapped else "Port 3"
         relabel_desc = "RELABELED (P3->S2, P2->S3)" if self.tri.is_swapped else "NORMAL (P2->S2, P3->S3)"
 
+        warp_flag = " [WARP-CUT!]" if is_clamped else ""
+        warp_stat = f" (Total: {self.kinematic_filter.warp_count})" if self.kinematic_filter else ""
+        speed_str = f"{speed:.2f} m/s ({speed * 3.6:.1f} km/h)"
+        heading_str = f"{heading:.1f}°"
+
         status_str = (
             f"[LINK] {conn_str}\n"
             f"Slave 1 (d1): {d1_str}\n"
@@ -304,7 +394,11 @@ class LocalGPSVisualizer:
             f"───────────────────────────────\n"
         )
         if pos is not None:
-            status_str += f"Robot: X={pos[0]:.3f} m, Y={pos[1]:.3f} m\nMode:  {mode}"
+            status_str += (
+                f"Robot: X={pos[0]:.3f} m, Y={pos[1]:.3f} m\n"
+                f"Speed: {speed_str} | Heading: {heading_str}\n"
+                f"Mode:  {mode}{warp_flag}{warp_stat}"
+            )
         else:
             status_str += f"Robot: Searching...\nMode:  {mode}"
 
@@ -333,7 +427,7 @@ class LocalGPSVisualizer:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Local GPS PC Visualizer with Auto-Calibration & Dynamic Relabeling")
+    parser = argparse.ArgumentParser(description="Local GPS PC Visualizer with Auto-Calibration & Kinematic Filtering")
     parser.add_argument("--port", type=str, default=None, help="Serial COM port (e.g. COM5)")
     parser.add_argument("--baud", type=int, default=115200, help="Baudrate (default: 115200)")
     parser.add_argument("--spacing", type=float, default=1.0, help="Default anchor spacing in meters (default: 1.0m)")
@@ -345,6 +439,13 @@ def main():
         default="auto",
         help="Relabeling mode: auto (match with nominal), normal (Port2=S2, Port3=S3), swap (Port3=S2, Port2=S3)",
     )
+    parser.add_argument(
+        "--max-speed",
+        type=float,
+        default=1.5,
+        help="Maximum physical robot velocity in m/s (default: 1.5 m/s). Cuts physically impossible warps.",
+    )
+    parser.add_argument("--no-kinematic", action="store_true", help="Disable physical kinematic motion filter")
     parser.add_argument("--range", type=float, default=4.0, help="Plot range in meters (default: 4.0m)")
     parser.add_argument("--sim", action="store_true", help="Run simulation mode without Arduino hardware")
     parser.add_argument("--no-filter", action="store_true", help="Disable moving average filter")
@@ -394,6 +495,8 @@ def main():
         nominal_d13=sx,
         relabel_mode=args.relabel,
         use_filter=not args.no_filter,
+        max_speed=args.max_speed,
+        use_kinematic=not args.no_kinematic,
         history_len=args.history,
         log_csv=log_path,
         plot_range=(rmin, rmax),

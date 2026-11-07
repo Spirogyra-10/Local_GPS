@@ -362,6 +362,132 @@ class MovingAverageFilter:
         avg_y = sum(self.history_y) / len(self.history_y)
         return avg_x, avg_y
 
+    def reset(self):
+        self.history_x = []
+        self.history_y = []
+
+
+class KinematicPositionFilter:
+    """ロボットの物理運動モデル (等速度運動 + 速度上限制約) に基づく自己位置フィルタ
+
+    - 測定ノイズによる物理的にあり得ない瞬間移動 (ワープ) を動的に検出・制限
+    - 速度ベクトル (vx, vy)、速さ [m/s]、進行方位角 [deg] のリアルタイム推定
+    - Alpha-Beta 追従フィルタによる滑らかな運動軌跡生成
+    """
+
+    def __init__(self, max_speed_mps: float = 1.5, alpha: float = 0.35, beta: float = 0.12):
+        """
+        Parameters
+        ----------
+        max_speed_mps : float
+            ロボットの想定最高速度 [m/s] (デフォルト: 1.5 m/s)。この速度を超えるジャンプは物理的にカット
+        alpha : float
+            位置追従ゲイン (0 < alpha <= 1.0)
+        beta : float
+            速度追従ゲイン (0 < beta <= 1.0)
+        """
+        self.max_speed_mps = float(max_speed_mps)
+        self.alpha = float(alpha)
+        self.beta = float(beta)
+        self.pos: Optional[np.ndarray] = None
+        self.vel: np.ndarray = np.array([0.0, 0.0], dtype=float)
+        self.last_time: Optional[float] = None
+        self.warp_count: int = 0
+        self.is_clamped_last: bool = False
+
+    def update(
+        self, raw_pos: Optional[Tuple[float, float]], timestamp: Optional[float] = None
+    ) -> Tuple[Optional[Tuple[float, float]], Tuple[float, float], float, float]:
+        """新しい推定座標を入力し、物理制約フィルタを適用した (pos, vel, speed, heading_deg) を返す
+
+        Parameters
+        ----------
+        raw_pos : Optional[Tuple[float, float]]
+            三辺測量等で得られた生 (x, y) 座標 [m]
+        timestamp : Optional[float]
+            現在時刻 [秒] (None の場合は time.time() を使用)
+
+        Returns
+        -------
+        filtered_pos : Optional[Tuple[float, float]]
+            平滑化・速度制限後の (x, y) 座標 [m]
+        vel : Tuple[float, float]
+            現在の速度ベクトル (vx, vy) [m/s]
+        speed : float
+            現在の移動速さ [m/s]
+        heading_deg : float
+            進行方位角 [度] (X軸基準反時計回り: 0〜360度)
+        """
+        import time
+
+        if raw_pos is None:
+            self.is_clamped_last = False
+            speed = float(np.hypot(self.vel[0], self.vel[1])) if self.pos is not None else 0.0
+            heading = float(math.degrees(math.atan2(self.vel[1], self.vel[0])) % 360) if speed > 0.05 else 0.0
+            cur_p = (float(self.pos[0]), float(self.pos[1])) if self.pos is not None else None
+            return cur_p, (float(self.vel[0]), float(self.vel[1])), speed, heading
+
+        now = timestamp if timestamp is not None else time.time()
+        raw_p = np.array(raw_pos, dtype=float)
+
+        if self.pos is None or self.last_time is None:
+            self.pos = raw_p.copy()
+            self.vel = np.array([0.0, 0.0], dtype=float)
+            self.last_time = now
+            self.is_clamped_last = False
+            return (float(self.pos[0]), float(self.pos[1])), (0.0, 0.0), 0.0, 0.0
+
+        dt = now - self.last_time
+        self.last_time = now
+
+        # dt が極端に小さい、または長時間途切れた場合の安全策
+        if dt < 1e-4:
+            dt = 1e-4
+        elif dt > 1.0:
+            # 1秒以上途切れた場合は運動モデルをリセットして現在位置を再採用
+            self.pos = raw_p.copy()
+            self.vel = np.array([0.0, 0.0], dtype=float)
+            self.is_clamped_last = False
+            return (float(self.pos[0]), float(self.pos[1])), (0.0, 0.0), 0.0, 0.0
+
+        # 1. 等速度運動モデルによる位置予測 (Prediction)
+        pred_pos = self.pos + self.vel * dt
+
+        # 2. 最高速度制限チェック (Physical Velocity Clamping)
+        diff = raw_p - self.pos
+        dist_jump = float(np.hypot(diff[0], diff[1]))
+        apparent_speed = dist_jump / dt
+
+        if apparent_speed > self.max_speed_mps and dist_jump > 1e-6:
+            self.warp_count += 1
+            self.is_clamped_last = True
+            # 移動量を最大許容速度分に強制クランプ
+            clamped_dist = self.max_speed_mps * dt
+            meas_pos = self.pos + diff * (clamped_dist / dist_jump)
+        else:
+            self.is_clamped_last = False
+            meas_pos = raw_p
+
+        # 3. Alpha-Beta 追従更新 (Correction)
+        residual = meas_pos - pred_pos
+        self.pos = pred_pos + self.alpha * residual
+        self.vel = self.vel + (self.beta / dt) * residual
+
+        # 速度ベクトルのノルムも最大速度にクリップ
+        speed = float(np.hypot(self.vel[0], self.vel[1]))
+        if speed > self.max_speed_mps and speed > 1e-6:
+            self.vel = self.vel * (self.max_speed_mps / speed)
+            speed = self.max_speed_mps
+
+        heading_deg = float(math.degrees(math.atan2(self.vel[1], self.vel[0])) % 360) if speed > 0.05 else 0.0
+        return (float(self.pos[0]), float(self.pos[1])), (float(self.vel[0]), float(self.vel[1])), speed, heading_deg
+
+    def reset(self):
+        self.pos = None
+        self.vel = np.array([0.0, 0.0], dtype=float)
+        self.last_time = None
+        self.is_clamped_last = False
+
 
 if __name__ == "__main__":
     # 単体テスト
@@ -409,5 +535,22 @@ if __name__ == "__main__":
     print(f"Relabeled Position Test: pos={pos_rel}, mode={mode_rel}")
     assert pos_rel is not None
     assert abs(pos_rel[0] - 0.5) < 1e-2 and abs(pos_rel[1] - 0.5) < 1e-2
+
+    # 5. 物理運動モデル (ワープ抑制 & 速度・方位推定) テスト
+    kf = KinematicPositionFilter(max_speed_mps=1.0)
+    # 0.0s: (0.0, 0.0)
+    p0, v0, s0, h0 = kf.update((0.0, 0.0), timestamp=0.0)
+    assert p0 == (0.0, 0.0)
+    # 0.1s: 正常な移動 (0.05, 0.0) -> 速度 0.5m/s (許容内)
+    p1, v1, s1, h1 = kf.update((0.05, 0.0), timestamp=0.1)
+    assert kf.is_clamped_last is False
+    assert s1 > 0.04
+    # 0.2s: ノイズによる突発ワープ (2.0, 0.0) -> 見かけ速度 19.5m/s -> クランプされるべき
+    p2, v2, s2, h2 = kf.update((2.0, 0.0), timestamp=0.2)
+    assert kf.is_clamped_last is True
+    assert kf.warp_count == 1
+    # 位置は 2.0 に飛ばず、最大速度 1.0m/s * 0.1s = 0.1m 付近に厳密に抑制される
+    assert p2[0] < 0.35
+    print(f"KinematicFilter Test: warp_suppressed={kf.warp_count}, clamped_x={p2[0]:.3f}, speed={s2:.2f}m/s, heading={h2:.1f}deg")
 
     print("All Trilateration tests passed!")
