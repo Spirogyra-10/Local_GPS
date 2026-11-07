@@ -18,6 +18,19 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Circle
 import numpy as np
 
+# Matplotlib 既定ショートカットの衝突をグローバルに無効化
+# f: 全画面, k/l: X/Y軸対数スケール化, c: 戻る, r: ホーム, g: グリッド
+for _key in [
+    "keymap.fullscreen",
+    "keymap.xscale",
+    "keymap.yscale",
+    "keymap.home",
+    "keymap.back",
+    "keymap.grid",
+    "keymap.grid_minor",
+]:
+    plt.rcParams[_key] = []
+
 from trilateration import (
     DistanceFilter,
     ExtendedKalmanFilter2D,
@@ -98,6 +111,18 @@ class LocalGPSVisualizer:
         self.trajectory_x = []
         self.trajectory_y = []
 
+        # Matplotlib 既定ショートカットの衝突を無効化 (f:全画面, k:X軸対数スケール化, c:戻る, r:ホーム, g:グリッド)
+        for conflict_key in [
+            "keymap.fullscreen",
+            "keymap.xscale",
+            "keymap.yscale",
+            "keymap.home",
+            "keymap.back",
+            "keymap.grid",
+            "keymap.grid_minor",
+        ]:
+            plt.rcParams[conflict_key] = []
+
         # Matplotlib 設定
         self.fig, self.ax = plt.subplots(figsize=(9, 9))
         self.fig.canvas.manager.set_window_title("Local GPS - UWB Positioning Monitor (EKF Tracking)")
@@ -141,9 +166,14 @@ class LocalGPSVisualizer:
                 self.filter = MovingAverageFilter(window_size=5)
             print(f"\n[GUI] 'F' key pressed -> Filter mode switched to: {self.filter_mode.upper()}")
         elif event.key in ("k", "K"):
-            # EKF 状態リセット
+            # EKF 状態リセット & 軸スケール正常化 (linear)
             self.ekf.reset()
-            print("\n[GUI] 'K' key pressed -> EKF state reset.")
+            self.ax.set_xscale("linear")
+            self.ax.set_yscale("linear")
+            rmin, rmax = self.plot_range
+            self.ax.set_xlim(rmin, rmax)
+            self.ax.set_ylim(rmin, rmax)
+            print("\n[GUI] 'K' key pressed -> EKF state reset (linear scale confirmed).")
 
     def setup_plot(self):
         self.ax.set_title("Realtime 2D Robot Position (UWB Trilateration)", fontsize=14, fontweight="bold")
