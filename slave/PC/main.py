@@ -7,6 +7,7 @@ Local GPS - UWB 自己位置推定 リアルタイム可視化 & ロギングア
 import argparse
 import csv
 import datetime
+import math
 import os
 import sys
 
@@ -17,7 +18,12 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Circle
 import numpy as np
 
-from trilateration import DistanceFilter, MovingAverageFilter, Trilateration
+from trilateration import (
+    DistanceFilter,
+    ExtendedKalmanFilter2D,
+    MovingAverageFilter,
+    Trilateration,
+)
 from serial_reader import DummySerialReader, SerialReader, list_available_ports
 
 
@@ -31,7 +37,7 @@ class LocalGPSVisualizer:
         nominal_d12=1.0,
         nominal_d13=1.0,
         relabel_mode="auto",
-        use_filter=True,
+        filter_mode="ekf",
         history_len=60,
         log_csv=None,
         plot_range=(-0.5, 4.0),
@@ -45,8 +51,10 @@ class LocalGPSVisualizer:
             nominal_d13=nominal_d13,
             relabel_mode=relabel_mode,
         )
-        self.dist_filter = DistanceFilter(alpha=0.35) if use_filter else None
-        self.filter = MovingAverageFilter(window_size=5) if use_filter else None
+        self.filter_mode = filter_mode.lower()  # "ekf", "moving_avg", or "raw"
+        self.dist_filter = DistanceFilter(alpha=0.35) if self.filter_mode != "raw" else None
+        self.filter = MovingAverageFilter(window_size=5)
+        self.ekf = ExtendedKalmanFilter2D(sigma_a=1.0, sigma_r=0.05, sigma_pos=0.08)
         self.history_len = history_len
         self.log_csv = log_csv
         self.csv_file = None
@@ -70,9 +78,16 @@ class LocalGPSVisualizer:
                     "d1_m",
                     "d2_m",
                     "d3_m",
+                    "raw_x_m",
+                    "raw_y_m",
                     "est_x_m",
                     "est_y_m",
+                    "vel_x_mps",
+                    "vel_y_mps",
+                    "speed_mps",
+                    "heading_deg",
                     "mode",
+                    "filter_mode",
                     "calib_d12",
                     "calib_d13",
                     "relabel",
@@ -85,7 +100,7 @@ class LocalGPSVisualizer:
 
         # Matplotlib 設定
         self.fig, self.ax = plt.subplots(figsize=(9, 9))
-        self.fig.canvas.manager.set_window_title("Local GPS - UWB Positioning Monitor (Auto-Relabeled)")
+        self.fig.canvas.manager.set_window_title("Local GPS - UWB Positioning Monitor (EKF Tracking)")
 
         # プロット要素の初期化
         self.setup_plot()
@@ -111,9 +126,24 @@ class LocalGPSVisualizer:
                 ], dtype=float)
             if self.dist_filter:
                 self.dist_filter.reset()
+            self.ekf.reset()
             self.on_calib_update(*getattr(self, "latest_calib", (self.tri.d12, self.tri.d13)))
             state_str = "SWAPPED (Port 3->S2, Port 2->S3)" if self.tri.is_swapped else "NORMAL (Port 2->S2, Port 3->S3)"
             print(f"\n[GUI] 'R' key pressed -> Manual mapping toggle: {state_str}")
+        elif event.key in ("f", "F"):
+            # フィルタモード切り替え (EKF -> MOVING_AVG -> RAW -> EKF)
+            modes = ["ekf", "moving_avg", "raw"]
+            idx = (modes.index(self.filter_mode) + 1) % len(modes) if self.filter_mode in modes else 0
+            self.filter_mode = modes[idx]
+            if self.filter_mode == "ekf":
+                self.ekf.reset()
+            elif self.filter_mode == "moving_avg":
+                self.filter = MovingAverageFilter(window_size=5)
+            print(f"\n[GUI] 'F' key pressed -> Filter mode switched to: {self.filter_mode.upper()}")
+        elif event.key in ("k", "K"):
+            # EKF 状態リセット
+            self.ekf.reset()
+            print("\n[GUI] 'K' key pressed -> EKF state reset.")
 
     def setup_plot(self):
         self.ax.set_title("Realtime 2D Robot Position (UWB Trilateration)", fontsize=14, fontweight="bold")
@@ -168,6 +198,11 @@ class LocalGPSVisualizer:
         (self.scatter_robot,) = self.ax.plot(
             [], [], marker="o", color="limegreen", markersize=14, markeredgecolor="darkgreen",
             markeredgewidth=2.0, zorder=6, label="Robot (Tag)"
+        )
+
+        # 速度・進行方位ベクトル矢印 (Velocity / Heading Vector)
+        (self.line_velocity,) = self.ax.plot(
+            [], [], color="crimson", linewidth=2.5, zorder=7, label="Velocity Vector"
         )
 
         # 測距円 (各アンカーからの円)
@@ -233,20 +268,60 @@ class LocalGPSVisualizer:
             fd1, fd2, fd3 = d1, d2, d3
 
         # 2. 三辺測量で位置推定 (ロバスト非線形最小二乗解)
-        pos, mode = self.tri.calculate_position(fd1, fd2, fd3)
+        raw_pos, mode = self.tri.calculate_position(fd1, fd2, fd3)
 
-        # 3. 座標ドメインでの平滑化 (移動平均)
-        if pos is not None and self.filter:
-            pos = self.filter.update(pos)
+        pos = raw_pos
+        vx, vy, speed, heading = 0.0, 0.0, 0.0, 0.0
+
+        if self.filter_mode == "ekf":
+            self.ekf.predict()
+            if raw_pos is not None:
+                if not self.ekf.is_initialized:
+                    self.ekf.reset(initial_pos=raw_pos)
+                pos = self.ekf.update_position(raw_pos)
+            elif self.ekf.is_initialized:
+                # 欠損時も残りの有効アンカー測距値で EKF 更新
+                pos = self.ekf.update_ranges(fd1, fd2, fd3, self.tri.anchors)
+                mode = "EKF_DR_FALLBACK"
+
+            if self.ekf.is_initialized:
+                px, py, vx, vy, speed, heading = self.ekf.get_state()
+                pos = (px, py)
+        elif self.filter_mode == "moving_avg":
+            if pos is not None and self.filter:
+                pos = self.filter.update(pos)
 
         # CSV ロギング
         if self.csv_writer:
             ts = datetime.datetime.now().isoformat()
-            px = f"{pos[0]:.4f}" if pos else ""
-            py = f"{pos[1]:.4f}" if pos else ""
+            r_px = f"{raw_pos[0]:.4f}" if raw_pos else ""
+            r_py = f"{raw_pos[1]:.4f}" if raw_pos else ""
+            px_str = f"{pos[0]:.4f}" if pos else ""
+            py_str = f"{pos[1]:.4f}" if pos else ""
             relabel_flag = "SWAPPED" if self.tri.is_swapped else "NORMAL"
             self.csv_writer.writerow(
-                [ts, raw_d1, raw_d2, raw_d3, d1, d2, d3, px, py, mode, c12, c13, relabel_flag]
+                [
+                    ts,
+                    raw_d1,
+                    raw_d2,
+                    raw_d3,
+                    d1,
+                    d2,
+                    d3,
+                    r_px,
+                    r_py,
+                    px_str,
+                    py_str,
+                    f"{vx:.3f}",
+                    f"{vy:.3f}",
+                    f"{speed:.3f}",
+                    f"{heading:.1f}",
+                    mode,
+                    self.filter_mode.upper(),
+                    c12,
+                    c13,
+                    relabel_flag,
+                ]
             )
 
         # プロット更新
@@ -259,8 +334,19 @@ class LocalGPSVisualizer:
 
             self.line_traj.set_data(self.trajectory_x, self.trajectory_y)
             self.scatter_robot.set_data([pos[0]], [pos[1]])
+
+            # 速度・進行方位ベクトル矢印の更新
+            if self.filter_mode == "ekf" and speed > 0.05:
+                arrow_len = min(0.8, max(0.15, speed * 0.6))
+                rad = math.radians(heading)
+                dx = arrow_len * math.cos(rad)
+                dy = arrow_len * math.sin(rad)
+                self.line_velocity.set_data([pos[0], pos[0] + dx], [pos[1], pos[1] + dy])
+            else:
+                self.line_velocity.set_data([], [])
         else:
             self.scatter_robot.set_data([], [])
+            self.line_velocity.set_data([], [])
 
         # 測距円の更新
         if d1 > 0:
@@ -300,11 +386,15 @@ class LocalGPSVisualizer:
             f"Mapping: {relabel_desc}\n"
             f"Calib S2(Y): {self.tri.d12:.2f} m (Nom: {self.tri.nominal_d12:.2f}m)\n"
             f"Calib S3(X): {self.tri.d13:.2f} m (Nom: {self.tri.nominal_d13:.2f}m)\n"
-            f"[C] Re-Calib | [R] Toggle Swap\n"
+            f"[C] Calib | [R] Swap | [F] Filter: {self.filter_mode.upper()}\n"
             f"───────────────────────────────\n"
         )
         if pos is not None:
-            status_str += f"Robot: X={pos[0]:.3f} m, Y={pos[1]:.3f} m\nMode:  {mode}"
+            if self.filter_mode == "ekf":
+                vel_str = f"Vel:   {speed:.2f} m/s ({heading:.1f}°)" if speed > 0.05 else "Vel:   0.00 m/s (Stationary)"
+                status_str += f"Robot: X={pos[0]:.3f} m, Y={pos[1]:.3f} m\n{vel_str}\nMode:  {mode}"
+            else:
+                status_str += f"Robot: X={pos[0]:.3f} m, Y={pos[1]:.3f} m\nMode:  {mode}"
         else:
             status_str += f"Robot: Searching...\nMode:  {mode}"
 
@@ -347,7 +437,12 @@ def main():
     )
     parser.add_argument("--range", type=float, default=4.0, help="Plot range in meters (default: 4.0m)")
     parser.add_argument("--sim", action="store_true", help="Run simulation mode without Arduino hardware")
-    parser.add_argument("--no-filter", action="store_true", help="Disable moving average filter")
+    parser.add_argument(
+        "--filter",
+        choices=["ekf", "moving_avg", "raw"],
+        default="ekf",
+        help="Filtering mode: ekf (Extended Kalman Filter), moving_avg (Moving Average), raw (Raw Trilateration)",
+    )
     parser.add_argument("--log", type=str, default=None, help="Path to save log CSV (e.g. log.csv)")
     parser.add_argument("--history", type=int, default=60, help="Trajectory history length (default: 60)")
 
@@ -393,7 +488,7 @@ def main():
         nominal_d12=sy,
         nominal_d13=sx,
         relabel_mode=args.relabel,
-        use_filter=not args.no_filter,
+        filter_mode=args.filter,
         history_len=args.history,
         log_csv=log_path,
         plot_range=(rmin, rmax),
