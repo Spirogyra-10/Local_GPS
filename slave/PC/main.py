@@ -26,6 +26,7 @@ class LocalGPSVisualizer:
         use_filter=True,
         history_len=60,
         log_csv=None,
+        plot_range=(-1.0, 4.0),
     ):
         self.reader = reader
         self.tri = Trilateration(anchor1, anchor2, anchor3)
@@ -34,6 +35,7 @@ class LocalGPSVisualizer:
         self.log_csv = log_csv
         self.csv_file = None
         self.csv_writer = None
+        self.plot_range = plot_range
 
         if self.log_csv:
             self.csv_file = open(self.log_csv, "w", newline="", encoding="utf-8")
@@ -47,7 +49,7 @@ class LocalGPSVisualizer:
         self.trajectory_y = []
 
         # Matplotlib 設定
-        self.fig, self.ax = plt.subplots(figsize=(8.5, 8.5))
+        self.fig, self.ax = plt.subplots(figsize=(9, 9))
         self.fig.canvas.manager.set_window_title("Local GPS - UWB Positioning Monitor")
 
         # プロット要素の初期化
@@ -61,8 +63,9 @@ class LocalGPSVisualizer:
         self.ax.set_aspect("equal", adjustable="box")
 
         # 表示範囲
-        self.ax.set_xlim(-0.4, 1.6)
-        self.ax.set_ylim(-0.4, 1.6)
+        rmin, rmax = self.plot_range
+        self.ax.set_xlim(rmin, rmax)
+        self.ax.set_ylim(rmin, rmax)
 
         # アンカープロット
         anchors = self.tri.anchors
@@ -79,9 +82,9 @@ class LocalGPSVisualizer:
         )
         for i, (ax_x, ax_y) in enumerate(anchors, start=1):
             self.ax.text(
-                ax_x + 0.04,
-                ax_y + 0.04,
-                f"Slave {i} ({ax_x:.1f}, {ax_y:.1f})",
+                ax_x + 0.05,
+                ax_y + 0.05,
+                f"Slave {i} ({ax_x:.2f}, {ax_y:.2f})",
                 fontsize=10,
                 color="navy",
                 fontweight="bold",
@@ -94,8 +97,8 @@ class LocalGPSVisualizer:
 
         # 現在位置プロット (Tag / Robot)
         (self.scatter_robot,) = self.ax.plot(
-            [], [], marker="o", color="limegreen", markersize=12, markeredgecolor="darkgreen",
-            markeredgewidth=1.5, zorder=6, label="Robot (Tag)"
+            [], [], marker="o", color="limegreen", markersize=14, markeredgecolor="darkgreen",
+            markeredgewidth=2.0, zorder=6, label="Robot (Tag)"
         )
 
         # 測距円 (各アンカーからの円)
@@ -106,34 +109,38 @@ class LocalGPSVisualizer:
         self.ax.add_patch(self.circle2)
         self.ax.add_patch(self.circle3)
 
-        # 情報表示テキスト
+        # 情報表示テキスト (右上固定)
         self.info_text = self.ax.text(
-            0.03,
-            0.96,
-            "",
+            0.02,
+            0.98,
+            "Connecting...",
             transform=self.ax.transAxes,
-            fontsize=10,
+            fontsize=10.5,
             verticalalignment="top",
-            family="monospace",
-            bbox=dict(boxstyle="round,pad=0.6", facecolor="white", alpha=0.9, edgecolor="lightgray"),
+            fontfamily="monospace",
+            bbox=dict(boxstyle="round,pad=0.5", facecolor="white", alpha=0.88, edgecolor="gray"),
+            zorder=10,
         )
 
-        self.ax.legend(loc="upper right", framealpha=0.9)
+        self.ax.legend(loc="lower right")
 
     def update_frame(self):
-        d1, d2, d3 = self.reader.get_latest_distances()
-        raw_pos, mode = self.tri.calculate_position(d1, d2, d3)
+        d1, d2, d3 = self.reader.latest_distances
 
-        pos = self.filter.update(raw_pos) if self.filter else raw_pos
+        # 三辺測量で位置推定
+        pos, mode = self.tri.calculate_position(d1, d2, d3)
 
-        # ロギング
+        if pos is not None and self.filter:
+            pos = self.filter.update(pos)
+
+        # CSV ロギング
         if self.csv_writer:
-            now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-            x_val = f"{pos[0]:.4f}" if pos else ""
-            y_val = f"{pos[1]:.4f}" if pos else ""
-            self.csv_writer.writerow([now_str, f"{d1:.3f}", f"{d2:.3f}", f"{d3:.3f}", x_val, y_val, mode])
+            ts = datetime.datetime.now().isoformat()
+            px = f"{pos[0]:.4f}" if pos else ""
+            py = f"{pos[1]:.4f}" if pos else ""
+            self.csv_writer.writerow([ts, d1, d2, d3, px, py, mode])
 
-        # 描画更新
+        # プロット更新
         if pos is not None:
             self.trajectory_x.append(pos[0])
             self.trajectory_y.append(pos[1])
@@ -143,14 +150,6 @@ class LocalGPSVisualizer:
 
             self.line_traj.set_data(self.trajectory_x, self.trajectory_y)
             self.scatter_robot.set_data([pos[0]], [pos[1]])
-
-            # モードによるマーカー色の変更
-            if mode == "3_ANCHORS":
-                self.scatter_robot.set_color("limegreen")
-                self.scatter_robot.set_markeredgecolor("darkgreen")
-            else:
-                self.scatter_robot.set_color("gold")
-                self.scatter_robot.set_markeredgecolor("darkorange")
         else:
             self.scatter_robot.set_data([], [])
 
@@ -197,16 +196,18 @@ class LocalGPSVisualizer:
     def run(self):
         self.reader.start()
 
-        timer = self.fig.canvas.new_timer(interval=33)
+        timer = self.fig.canvas.new_timer(interval=50)
         timer.add_callback(self.update_frame)
         timer.start()
 
         try:
             plt.show()
+        except KeyboardInterrupt:
+            pass
         finally:
-            self.close()
+            self.cleanup()
 
-    def close(self):
+    def cleanup(self):
         self.reader.stop()
         if self.csv_file:
             self.csv_file.close()
@@ -215,8 +216,10 @@ class LocalGPSVisualizer:
 
 def main():
     parser = argparse.ArgumentParser(description="Local GPS PC Visualizer & Position Estimator")
-    parser.add_argument("--port", type=str, default=None, help="Serial COM port (e.g. COM3)")
+    parser.add_argument("--port", type=str, default=None, help="Serial COM port (e.g. COM5)")
     parser.add_argument("--baud", type=int, default=115200, help="Baudrate (default: 115200)")
+    parser.add_argument("--spacing", type=float, default=1.0, help="Anchor spacing in meters (default: 1.0m)")
+    parser.add_argument("--range", type=float, default=4.0, help="Plot range in meters (default: 4.0m)")
     parser.add_argument("--sim", action="store_true", help="Run simulation mode without Arduino hardware")
     parser.add_argument("--no-filter", action="store_true", help="Disable moving average filter")
     parser.add_argument("--log", type=str, default=None, help="Path to save log CSV (e.g. log.csv)")
@@ -224,22 +227,28 @@ def main():
 
     args = parser.parse_args()
 
+    # アンカー座標設定 (S1: 原点, S2: Y軸, S3: X軸)
+    s = args.spacing
+    anchor1 = (0.0, 0.0)
+    anchor2 = (0.0, s)
+    anchor3 = (s, 0.0)
+
     if args.sim:
         print("[Mode] Running in SIMULATION mode.")
-        reader = DummySerialReader()
+        reader = DummySerialReader(anchor1, anchor2, anchor3)
     else:
-        if args.port is None:
+        port = args.port
+        if port is None:
             available = list_available_ports()
             if not available:
                 print("[Warning] No COM ports detected. Falling back to --sim mode.")
-                reader = DummySerialReader()
+                reader = DummySerialReader(anchor1, anchor2, anchor3)
             else:
-                print(f"[Serial] Available ports: {available}")
                 port = available[0]
-                print(f"[Serial] Using port: {port}")
+                print(f"[Serial] Using detected port: {port}")
                 reader = SerialReader(port=port, baudrate=args.baud)
         else:
-            reader = SerialReader(port=args.port, baudrate=args.baud)
+            reader = SerialReader(port=port, baudrate=args.baud)
 
     log_path = args.log
     if log_path is None:
@@ -247,11 +256,18 @@ def main():
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         log_path = os.path.join("logs", f"ranging_log_{timestamp}.csv")
 
+    rmin = -0.5 * s if s > 0 else -0.5
+    rmax = max(args.range, s * 1.5)
+
     app = LocalGPSVisualizer(
         reader=reader,
+        anchor1=anchor1,
+        anchor2=anchor2,
+        anchor3=anchor3,
         use_filter=not args.no_filter,
         history_len=args.history,
         log_csv=log_path,
+        plot_range=(rmin, rmax),
     )
     app.run()
 
