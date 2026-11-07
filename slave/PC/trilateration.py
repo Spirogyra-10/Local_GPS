@@ -8,6 +8,7 @@ UWB 測距データに基づく2次元自己位置推定 (三辺測量) モジ�
 """
 
 import math
+import time
 from typing import Optional, Tuple
 import numpy as np
 
@@ -428,6 +429,419 @@ class MovingAverageFilter:
         return avg_x, avg_y
 
 
+class KinematicPositionFilter:
+    """ロボットの物理運動モデル (等速度運動 + 速度上限制約) に基づく自己位置フィルタ
+
+    - 測定ノイズによる物理的にあり得ない瞬間移動 (ワープ) を動的に検出・制限
+    - 速度ベクトル (vx, vy)、速さ [m/s]、進行方位角 [deg] のリアルタイム推定
+    - Alpha-Beta 追従フィルタによる滑らかな運動軌跡生成
+    """
+
+    def __init__(self, max_speed_mps: float = 1.5, alpha: float = 0.35, beta: float = 0.12):
+        """
+        Parameters
+        ----------
+        max_speed_mps : float
+            ロボットの想定最高速度 [m/s] (デフォルト: 1.5 m/s)。この速度を超えるジャンプは物理的にカット
+        alpha : float
+            位置追従ゲイン (0 < alpha <= 1.0)
+        beta : float
+            速度追従ゲイン (0 < beta <= 1.0)
+        """
+        self.max_speed_mps = float(max_speed_mps)
+        self.alpha = float(alpha)
+        self.beta = float(beta)
+        self.pos: Optional[np.ndarray] = None
+        self.vel: np.ndarray = np.array([0.0, 0.0], dtype=float)
+        self.last_time: Optional[float] = None
+        self.warp_count: int = 0
+        self.is_clamped_last: bool = False
+
+    def update(
+        self, raw_pos: Optional[Tuple[float, float]], timestamp: Optional[float] = None
+    ) -> Tuple[Optional[Tuple[float, float]], Tuple[float, float], float, float]:
+        """新しい推定座標を入力し、物理制約フィルタを適用した (pos, vel, speed, heading_deg) を返す
+
+        Parameters
+        ----------
+        raw_pos : Optional[Tuple[float, float]]
+            三辺測量等で得られた生 (x, y) 座標 [m]
+        timestamp : Optional[float]
+            現在時刻 [秒] (None の場合は time.time() を使用)
+
+        Returns
+        -------
+        filtered_pos : Optional[Tuple[float, float]]
+            平滑化・速度制限後の (x, y) 座標 [m]
+        vel : Tuple[float, float]
+            現在の速度ベクトル (vx, vy) [m/s]
+        speed : float
+            現在の移動速さ [m/s]
+        heading_deg : float
+            進行方位角 [度] (X軸基準反時計回り: 0〜360度)
+        """
+        if raw_pos is None:
+            self.is_clamped_last = False
+            speed = float(np.hypot(self.vel[0], self.vel[1])) if self.pos is not None else 0.0
+            heading = float(math.degrees(math.atan2(self.vel[1], self.vel[0])) % 360) if speed > 0.05 else 0.0
+            cur_p = (float(self.pos[0]), float(self.pos[1])) if self.pos is not None else None
+            return cur_p, (float(self.vel[0]), float(self.vel[1])), speed, heading
+
+        now = timestamp if timestamp is not None else time.time()
+        raw_p = np.array(raw_pos, dtype=float)
+
+        if self.pos is None or self.last_time is None:
+            self.pos = raw_p.copy()
+            self.vel = np.array([0.0, 0.0], dtype=float)
+            self.last_time = now
+            self.is_clamped_last = False
+            return (float(self.pos[0]), float(self.pos[1])), (0.0, 0.0), 0.0, 0.0
+
+        dt = now - self.last_time
+        self.last_time = now
+
+        # dt が極端に小さい、または長時間途切れた場合の安全策
+        if dt < 1e-4:
+            dt = 1e-4
+        elif dt > 1.0:
+            # 1秒以上途切れた場合は運動モデルをリセットして現在位置を再採用
+            self.pos = raw_p.copy()
+            self.vel = np.array([0.0, 0.0], dtype=float)
+            self.is_clamped_last = False
+            return (float(self.pos[0]), float(self.pos[1])), (0.0, 0.0), 0.0, 0.0
+
+        # 1. 等速度運動モデルによる位置予測 (Prediction)
+        pred_pos = self.pos + self.vel * dt
+
+        # 2. 最高速度制限チェック (Physical Velocity Clamping)
+        diff = raw_p - self.pos
+        dist_jump = float(np.hypot(diff[0], diff[1]))
+        apparent_speed = dist_jump / dt
+
+        if apparent_speed > self.max_speed_mps and dist_jump > 1e-6:
+            self.warp_count += 1
+            self.is_clamped_last = True
+            # 移動量を最大許容速度分に強制クランプ
+            clamped_dist = self.max_speed_mps * dt
+            meas_pos = self.pos + diff * (clamped_dist / dist_jump)
+        else:
+            self.is_clamped_last = False
+            meas_pos = raw_p
+
+        # 3. Alpha-Beta 追従更新 (Correction)
+        residual = meas_pos - pred_pos
+        self.pos = pred_pos + self.alpha * residual
+        self.vel = self.vel + (self.beta / dt) * residual
+
+        # 速度ベクトルのノルムも最大速度にクリップ
+        speed = float(np.hypot(self.vel[0], self.vel[1]))
+        if speed > self.max_speed_mps and speed > 1e-6:
+            self.vel = self.vel * (self.max_speed_mps / speed)
+            speed = self.max_speed_mps
+
+        heading_deg = float(math.degrees(math.atan2(self.vel[1], self.vel[0])) % 360) if speed > 0.05 else 0.0
+        return (float(self.pos[0]), float(self.pos[1])), (float(self.vel[0]), float(self.vel[1])), speed, heading_deg
+
+    def reset(self):
+        self.pos = None
+        self.vel = np.array([0.0, 0.0], dtype=float)
+        self.last_time = None
+        self.is_clamped_last = False
+
+
+class ExtendedKalmanFilter2D:
+    """2次元等速運動モデル (Constant Velocity) に基づく拡張カルマンフィルタ (EKF)
+
+    状態ベクトル: x = [px, py, vx, vy]^T
+    観測モデル:
+      1) 非線形距離観測 (Direct Range EKF): z = [d1, d2, d3]^T
+         h_i(x) = sqrt((px - a_ix)^2 + (py - a_iy)^2)
+      2) 座標観測 (Linear KF Update): z = [px, py]^T
+
+    特徴:
+      - 欠損アンカー (2点以下) 時の動的適応更新
+      - 3-sigma 残差ゲーティングによるマルチパス・外れ値リジェクション
+      - 速度ベクトル (vx, vy)、速さ、進行方位角のリアルタイム推定
+      - 状態共分散行列 P からの自己位置不確かさ推定
+    """
+
+    def __init__(
+        self,
+        sigma_a: float = 1.0,
+        sigma_r: float = 0.05,
+        sigma_pos: float = 0.08,
+        p_init_pos: float = 0.5,
+        p_init_vel: float = 1.0,
+    ):
+        """
+        Parameters
+        ----------
+        sigma_a : float
+            プロセスノイズ: 加速度変動の標準偏差 [m/s^2]
+        sigma_r : float
+            観測ノイズ: UWB測距の標準偏差 [m] (デフォルト: 0.05m)
+        sigma_pos : float
+            観測ノイズ: 三辺測量座標の標準偏差 [m] (デフォルト: 0.08m)
+        p_init_pos : float
+            初期位置共分散の標準偏差 [m]
+        p_init_vel : float
+            初期速度共分散の標準偏差 [m/s]
+        """
+        self.sigma_a = float(sigma_a)
+        self.sigma_r = float(sigma_r)
+        self.sigma_pos = float(sigma_pos)
+
+        # 状態ベクトル [x, y, vx, vy]^T
+        self.x = np.zeros(4, dtype=float)
+
+        # 状態共分散行列 P (4x4)
+        self.P = np.diag([
+            p_init_pos ** 2,
+            p_init_pos ** 2,
+            p_init_vel ** 2,
+            p_init_vel ** 2,
+        ]).astype(float)
+
+        self.last_time: Optional[float] = None
+        self.is_initialized = False
+        self.last_valid_heading: float = 0.0
+
+    def reset(self, initial_pos: Optional[Tuple[float, float]] = None):
+        """フィルタをリセットする"""
+        if initial_pos is not None:
+            self.x = np.array([initial_pos[0], initial_pos[1], 0.0, 0.0], dtype=float)
+            self.P = np.diag([0.1 ** 2, 0.1 ** 2, 1.0 ** 2, 1.0 ** 2]).astype(float)
+            self.is_initialized = True
+        else:
+            self.x = np.zeros(4, dtype=float)
+            self.P = np.diag([1.0 ** 2, 1.0 ** 2, 2.0 ** 2, 2.0 ** 2]).astype(float)
+            self.is_initialized = False
+        self.last_time = None
+        self.last_valid_heading = 0.0
+
+    def predict(self, dt: Optional[float] = None) -> np.ndarray:
+        """状態予測ステップ (時間発展)
+
+        Parameters
+        ----------
+        dt : Optional[float]
+            前回ステップからの経過時間 [秒]。省略時は内部タイマーで自動計算。
+
+        Returns
+        -------
+        np.ndarray
+            予測状態ベクトル [x, y, vx, vy]
+        """
+        now = time.perf_counter()
+        if dt is None:
+            if self.last_time is not None:
+                dt = now - self.last_time
+                # 異常に長い/短いステップ幅を安全にクランプ
+                dt = max(0.005, min(0.5, dt))
+            else:
+                dt = 0.05
+        self.last_time = now
+
+        # 状態遷移行列 F
+        F = np.array([
+            [1.0, 0.0, dt,  0.0],
+            [0.0, 1.0, 0.0, dt],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ], dtype=float)
+
+        # 離散白色加速度ノイズモデル Q
+        dt2 = dt * dt
+        dt3 = dt2 * dt
+        dt4 = dt3 * dt
+        q_pos = 0.25 * dt4 * (self.sigma_a ** 2)
+        q_cross = 0.5 * dt3 * (self.sigma_a ** 2)
+        q_vel = dt2 * (self.sigma_a ** 2)
+
+        Q = np.array([
+            [q_pos,   0.0,     q_cross, 0.0],
+            [0.0,     q_pos,   0.0,     q_cross],
+            [q_cross, 0.0,     q_vel,   0.0],
+            [0.0,     q_cross, 0.0,     q_vel],
+        ], dtype=float)
+
+        # 予測
+        self.x = F @ self.x
+        self.P = F @ self.P @ F.T + Q
+        # 対称性維持
+        self.P = 0.5 * (self.P + self.P.T)
+        return self.x
+
+    def update_position(
+        self, pos: Tuple[float, float], gate_m: float = 1.5
+    ) -> Tuple[float, float]:
+        """三辺測量で得られた (x, y) 座標による線形カルマン更新
+
+        Parameters
+        ----------
+        pos : Tuple[float, float]
+            観測されたロボット座標 (x, y) [m]
+        gate_m : float
+            外れ値リジェクションの残差ゲート [m] (これを超える跳躍は除外)
+
+        Returns
+        -------
+        Tuple[float, float]
+            更新後の平滑化座標 (x, y)
+        """
+        if not self.is_initialized:
+            self.x[0] = pos[0]
+            self.x[1] = pos[1]
+            self.x[2] = 0.0
+            self.x[3] = 0.0
+            self.is_initialized = True
+            return pos[0], pos[1]
+
+        z = np.array([pos[0], pos[1]], dtype=float)
+        H = np.array([
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+        ], dtype=float)
+
+        y = z - H @ self.x  # イノベーション
+        residual_norm = float(np.hypot(y[0], y[1]))
+
+        # 外れ値ゲーティング (物理的にありえない大ジャンプを抑制)
+        if residual_norm > gate_m:
+            y = (gate_m / residual_norm) * y
+
+        R = (self.sigma_pos ** 2) * np.eye(2, dtype=float)
+        S = H @ self.P @ H.T + R
+        K = self.P @ H.T @ np.linalg.inv(S)
+
+        self.x = self.x + K @ y
+        I_KH = np.eye(4, dtype=float) - K @ H
+        self.P = I_KH @ self.P @ I_KH.T + K @ R @ K.T
+        self.P = 0.5 * (self.P + self.P.T)
+
+        return float(self.x[0]), float(self.x[1])
+
+    def update_ranges(
+        self,
+        d1: float,
+        d2: float,
+        d3: float,
+        anchors: np.ndarray,
+        gate_m: float = 0.8,
+    ) -> Tuple[float, float]:
+        """UWB生測距値による拡張カルマンフィルタ (EKF) 更新
+        非線形観測方程式 h_i(x) = ||p - a_i|| のヤコビアンを用いて直接更新。
+        一部アンカー欠損時でも有効アンカーのみで動的適応更新可能。
+
+        Parameters
+        ----------
+        d1, d2, d3 : float
+            各アンカーへの測距値 [m] (無効値は <= 0)
+        anchors : np.ndarray
+            アンカー座標配列 shape: (3, 2)
+        gate_m : float
+            測距残差の許容ゲート幅 [m] (マルチパス跳躍の外れ値除外)
+
+        Returns
+        -------
+        Tuple[float, float]
+            更新後の平滑化座標 (x, y)
+        """
+        raw_dists = [d1, d2, d3]
+        valid_indices = [i for i, d in enumerate(raw_dists) if d > 0.05]
+
+        if not self.is_initialized:
+            return float(self.x[0]), float(self.x[1])
+
+        if len(valid_indices) == 0:
+            return float(self.x[0]), float(self.x[1])
+
+        px, py = self.x[0], self.x[1]
+        active_H = []
+        active_y = []
+        active_R = []
+
+        for idx in valid_indices:
+            an = anchors[idx]
+            dx = px - an[0]
+            dy = py - an[1]
+            dist_est = math.hypot(dx, dy)
+            dist_est = max(dist_est, 1e-4)
+
+            residual = raw_dists[idx] - dist_est
+
+            # 外れ値ゲーティング (マルチパス急変のクランプ)
+            if abs(residual) > gate_m:
+                residual = math.copysign(gate_m, residual)
+
+            h_row = [dx / dist_est, dy / dist_est, 0.0, 0.0]
+            active_H.append(h_row)
+            active_y.append(residual)
+            active_R.append(self.sigma_r ** 2)
+
+        H = np.array(active_H, dtype=float)
+        y = np.array(active_y, dtype=float)
+        R = np.diag(active_R).astype(float)
+
+        S = H @ self.P @ H.T + R
+        det_S = float(np.linalg.det(S))
+        if det_S < 1e-9:
+            return float(self.x[0]), float(self.x[1])
+
+        K = self.P @ H.T @ np.linalg.inv(S)
+
+        self.x = self.x + K @ y
+        I_KH = np.eye(4, dtype=float) - K @ H
+        self.P = I_KH @ self.P @ I_KH.T + K @ R @ K.T
+        self.P = 0.5 * (self.P + self.P.T)
+
+        return float(self.x[0]), float(self.x[1])
+
+    def get_state(self) -> Tuple[float, float, float, float, float, float]:
+        """推定された状態と運動指標を取得する
+
+        Returns
+        -------
+        px : float
+            X座標 [m]
+        py : float
+            Y座標 [m]
+        vx : float
+            X方向速度 [m/s]
+        vy : float
+            Y方向速度 [m/s]
+        speed : float
+            速さ [m/s]
+        heading_deg : float
+            進行方位角 [度] (0~360度, X軸基準反時計回り)
+        """
+        px = float(self.x[0])
+        py = float(self.x[1])
+        vx = float(self.x[2])
+        vy = float(self.x[3])
+        speed = float(math.hypot(vx, vy))
+
+        # 静止時(速度 < 0.05m/s)の方位角ハンチング・暴れを抑制
+        if speed > 0.05:
+            self.last_valid_heading = float(math.degrees(math.atan2(vy, vx)) % 360)
+
+        return px, py, vx, vy, speed, self.last_valid_heading
+
+    def get_position_uncertainty(self) -> Tuple[float, float]:
+        """自己位置の 95% (2-sigma) 不確かさ半径 [m] を取得する
+
+        Returns
+        -------
+        sigma_x : float
+            X方向 2-sigma 不確かさ [m]
+        sigma_y : float
+            Y方向 2-sigma 不確かさ [m]
+        """
+        sx = 2.0 * math.sqrt(max(0.0, float(self.P[0, 0])))
+        sy = 2.0 * math.sqrt(max(0.0, float(self.P[1, 1])))
+        return sx, sy
+
+
 if __name__ == "__main__":
     # 単体テスト
     tri = Trilateration()
@@ -486,4 +900,40 @@ if __name__ == "__main__":
     print(f"Narrow GDOP Test: hdop={hdop_n:.2f}, rating={rating_n}, ellipse=({a_n:.3f}m, {b_n:.3f}m)")
     assert hdop_n > 10.0 and rating_n == "POOR (SPREAD ANCHORS!)"
 
-    print("All Trilateration tests passed!")
+    # 6. 物理運動モデル (ワープ抑制 & 速度・方位推定) テスト
+    kf = KinematicPositionFilter(max_speed_mps=1.0)
+    p0, v0, s0, h0 = kf.update((0.0, 0.0), timestamp=0.0)
+    assert p0 == (0.0, 0.0)
+    p1, v1, s1, h1 = kf.update((0.05, 0.0), timestamp=0.1)
+    assert kf.is_clamped_last is False
+    assert s1 > 0.04
+    p2, v2, s2, h2 = kf.update((2.0, 0.0), timestamp=0.2)
+    assert kf.is_clamped_last is True
+    assert kf.warp_count == 1
+    assert p2[0] < 0.35
+    print(f"KinematicFilter Test: warp_suppressed={kf.warp_count}, clamped_x={p2[0]:.3f}, speed={s2:.2f}m/s, heading={h2:.1f}deg")
+
+    # 7. EKF トラッキングテスト (等速直線運動 + 測距ノイズ + 1点欠損耐性)
+    ekf = ExtendedKalmanFilter2D(sigma_a=0.5, sigma_r=0.03, sigma_pos=0.05)
+    ekf.reset(initial_pos=(0.0, 0.0))
+    anchors = np.array([[0.0, 0.0], [0.0, 2.0], [2.0, 0.0]])
+    dt = 0.1
+    true_x, true_y = 0.0, 0.0
+    vx_true, vy_true = 0.4, 0.3  # speed = 0.5 m/s, heading = ~36.87 deg
+
+    for step in range(30):
+        true_x += vx_true * dt
+        true_y += vy_true * dt
+        ekf.predict(dt=dt)
+        d1 = math.hypot(true_x, true_y) + (0.01 if step % 2 == 0 else -0.01)
+        d2 = math.hypot(true_x, true_y - 2.0)
+        d3 = -1.0 if 20 <= step <= 25 else math.hypot(true_x - 2.0, true_y)
+        ekf.update_ranges(d1, d2, d3, anchors)
+
+    px, py, vx, vy, spd, hdg = ekf.get_state()
+    print(f"EKF Tracking Result: pos=({px:.3f}, {py:.3f}), true=({true_x:.3f}, {true_y:.3f}), speed={spd:.3f} m/s, heading={hdg:.1f}°")
+    assert abs(px - true_x) < 0.15 and abs(py - true_y) < 0.15
+    assert abs(spd - 0.5) < 0.15
+    assert abs(hdg - 36.87) < 10.0
+
+    print("All Trilateration, GDOP, Kinematic, and EKF tests passed!")
