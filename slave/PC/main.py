@@ -13,12 +13,13 @@ import sys
 # 自ディレクトリをモジュール検索パスに追加 (どこから起動しても安全にインポート可能)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import matplotlib.pyplot as plt
-from matplotlib.patches import Circle
 import numpy as np
 
 from trilateration import DistanceFilter, MovingAverageFilter, Trilateration
 from serial_reader import DummySerialReader, SerialReader, list_available_ports
+
+plt = None
+Circle = None
 
 
 class LocalGPSVisualizer:
@@ -83,7 +84,15 @@ class LocalGPSVisualizer:
         self.trajectory_x = []
         self.trajectory_y = []
 
-        # Matplotlib 設定
+        # Matplotlib 設定 (遅延インポート)
+        global plt, Circle
+        if plt is None or Circle is None:
+            import matplotlib.pyplot as _plt
+            from matplotlib.patches import Circle as _Circle
+
+            plt = _plt
+            Circle = _Circle
+
         self.fig, self.ax = plt.subplots(figsize=(9, 9))
         self.fig.canvas.manager.set_window_title("Local GPS - UWB Positioning Monitor (Auto-Relabeled)")
 
@@ -350,6 +359,15 @@ def main():
     parser.add_argument("--no-filter", action="store_true", help="Disable moving average filter")
     parser.add_argument("--log", type=str, default=None, help="Path to save log CSV (e.g. log.csv)")
     parser.add_argument("--history", type=int, default=60, help="Trajectory history length (default: 60)")
+    parser.add_argument(
+        "--gui",
+        choices=["web", "matplotlib"],
+        default="web",
+        help="GUI backend: web (browser, default) or matplotlib (legacy)",
+    )
+    parser.add_argument("--host", type=str, default="127.0.0.1", help="Host address for Web GUI server (default: 127.0.0.1)")
+    parser.add_argument("--web-port", type=int, default=8080, help="HTTP port for Web GUI server (default: 8080)")
+    parser.add_argument("--no-browser", action="store_true", help="Do not automatically open the browser in web GUI mode")
 
     args = parser.parse_args()
 
@@ -359,9 +377,13 @@ def main():
     anchor2 = (0.0, sy)
     anchor3 = (sx, 0.0)
 
+    is_sim = False
+    port_label = ""
     if args.sim:
         print("[Mode] Running in SIMULATION mode.")
         reader = DummySerialReader(anchor1, anchor2, anchor3)
+        is_sim = True
+        port_label = "SIMULATION"
     else:
         port = args.port
         if port is None:
@@ -369,12 +391,16 @@ def main():
             if not available:
                 print("[Warning] No COM ports detected. Falling back to --sim mode.")
                 reader = DummySerialReader(anchor1, anchor2, anchor3)
+                is_sim = True
+                port_label = "SIMULATION"
             else:
                 port = available[0]
                 print(f"[Serial] Using detected port: {port}")
                 reader = SerialReader(port=port, baudrate=args.baud)
+                port_label = port
         else:
             reader = SerialReader(port=port, baudrate=args.baud)
+            port_label = port
 
     log_path = args.log
     if log_path is None:
@@ -385,20 +411,43 @@ def main():
     rmin = -0.5
     rmax = max(args.range, max(sy, sx) * 1.5)
 
-    app = LocalGPSVisualizer(
-        reader=reader,
-        anchor1=anchor1,
-        anchor2=anchor2,
-        anchor3=anchor3,
-        nominal_d12=sy,
-        nominal_d13=sx,
-        relabel_mode=args.relabel,
-        use_filter=not args.no_filter,
-        history_len=args.history,
-        log_csv=log_path,
-        plot_range=(rmin, rmax),
-    )
-    app.run()
+    if args.gui == "web":
+        from web_visualizer import WebGPSVisualizer
+
+        app = WebGPSVisualizer(
+            reader=reader,
+            anchor1=anchor1,
+            anchor2=anchor2,
+            anchor3=anchor3,
+            nominal_d12=sy,
+            nominal_d13=sx,
+            relabel_mode=args.relabel,
+            use_filter=not args.no_filter,
+            history_len=args.history,
+            log_csv=log_path,
+            plot_range=(rmin, rmax),
+            host=args.host,
+            web_port=args.web_port,
+            open_browser=not args.no_browser,
+            port_label=port_label,
+            is_sim=is_sim,
+        )
+        app.run()
+    else:
+        app = LocalGPSVisualizer(
+            reader=reader,
+            anchor1=anchor1,
+            anchor2=anchor2,
+            anchor3=anchor3,
+            nominal_d12=sy,
+            nominal_d13=sx,
+            relabel_mode=args.relabel,
+            use_filter=not args.no_filter,
+            history_len=args.history,
+            log_csv=log_path,
+            plot_range=(rmin, rmax),
+        )
+        app.run()
 
 
 if __name__ == "__main__":
