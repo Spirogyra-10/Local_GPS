@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="ja" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Local GPS — UWB 自己位置モニター</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-icon" aria-hidden="true">◎</span>
+      <div class="brand-text">
+        <h1>Local GPS — UWB 自己位置モニター</h1>
+        <span class="brand-sub">2D Trilateration &amp; Distance-Adaptive Telemetry</span>
+      </div>
+    </div>
+
+    <div class="status-pills">
+      <div id="connBadge" class="pill pill-disconnected" title="シリアル接続状態">
+        <span class="dot"></span>
+        <span id="connText">CONNECTING...</span>
+      </div>
+      <div id="modeBadge" class="pill pill-mode" title="測位モード">ERROR</div>
+      <div id="hzBadge" class="pill pill-neutral" title="更新レート">0.0 Hz</div>
+      <div id="logChip" class="pill pill-log" title="">LOG: --</div>
+      <button id="btnTheme" class="btn-theme" type="button" title="ライト / ダークテーマ切替">
+        ☀ Light
+      </button>
+    </div>
+  </header>
+
+  <main class="layout">
+    <section class="map-panel" id="mapContainer">
+      <canvas id="mapCanvas"></canvas>
+
+      <div id="eventToast" class="event-toast hidden" role="status" aria-live="polite"></div>
+
+      <div class="map-toolbar">
+        <button id="btnAutoScale" class="tool-btn active" type="button" title="距離に応じて表示範囲を自動調整 [A]">
+          自動スケール: ON
+        </button>
+        <div class="zoom-group">
+          <button id="btnZoomOut" class="tool-btn icon-btn" type="button" title="ズームアウト">−</button>
+          <button id="btnZoomIn" class="tool-btn icon-btn" type="button" title="ズームイン">＋</button>
+          <button id="btnFit" class="tool-btn" type="button" title="全体表示に戻す [A]">全体</button>
+        </div>
+      </div>
+
+      <div class="map-scale-hud">
+        <div class="scale-bar-wrap">
+          <div id="scaleBar" class="scale-bar"></div>
+          <span id="scaleBarLabel" class="scale-bar-label">1.0 m</span>
+        </div>
+        <div id="viewportRangeText" class="viewport-range-text">表示範囲: -- m × -- m (AUTO)</div>
+      </div>
+
+      <div class="map-legend">
+        <span class="legend-item"><i class="sym sym-anchor"></i>Anchors</span>
+        <span class="legend-item"><i class="sym sym-robot"></i>Robot (Tag)</span>
+        <span class="legend-item"><i class="sym sym-traj"></i>Trajectory</span>
+        <span class="legend-item"><i class="sym sym-s1"></i>S1</span>
+        <span class="legend-item"><i class="sym sym-s2"></i>S2</span>
+        <span class="legend-item"><i class="sym sym-s3"></i>S3</span>
+      </div>
+    </section>
+
+    <aside class="side-panel">
+      <!-- 1. Position Hero Card -->
+      <section class="card hero-card">
+        <div class="card-header">
+          <h2>推定座標 (Robot Position)</h2>
+          <span id="heroQuality" class="sub-tag">待機中</span>
+        </div>
+        <div class="coord-grid">
+          <div class="coord-box">
+            <span class="coord-axis">X</span>
+            <div class="coord-value-wrap">
+              <span id="posX" class="coord-value">--.---</span>
+              <span class="coord-unit">m</span>
+            </div>
+          </div>
+          <div class="coord-box">
+            <span class="coord-axis">Y</span>
+            <div class="coord-value-wrap">
+              <span id="posY" class="coord-value">--.---</span>
+              <span class="coord-unit">m</span>
+            </div>
+          </div>
+        </div>
+        <div class="secondary-metrics">
+          <div class="metric-item">
+            <span class="metric-label">原点距離 R</span>
+            <span id="metricRange" class="metric-val">--.-- m</span>
+          </div>
+          <div class="metric-item">
+            <span class="metric-label">方位角 θ</span>
+            <span id="metricAngle" class="metric-val">---.- °</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- 2. Anchor Distances Card -->
+      <section class="card">
+        <div class="card-header">
+          <h2>各アンカー測距値 (Distances)</h2>
+          <span class="sub-tag">実測値</span>
+        </div>
+        <div class="dist-list">
+          <div class="dist-row">
+            <div class="dist-row-head">
+              <span id="distLabel1" class="dist-name"><i class="color-dot s1"></i>Slave 1 (原点)</span>
+              <span id="distVal1" class="dist-val lost">LOST</span>
+            </div>
+            <div class="dist-bar-track"><div id="distBar1" class="dist-bar s1"></div></div>
+          </div>
+
+          <div class="dist-row">
+            <div class="dist-row-head">
+              <span id="distLabel2" class="dist-name"><i class="color-dot s2"></i>Slave 2 [P2]</span>
+              <span id="distVal2" class="dist-val lost">LOST</span>
+            </div>
+            <div class="dist-bar-track"><div id="distBar2" class="dist-bar s2"></div></div>
+          </div>
+
+          <div class="dist-row">
+            <div class="dist-row-head">
+              <span id="distLabel3" class="dist-name"><i class="color-dot s3"></i>Slave 3 [P3]</span>
+              <span id="distVal3" class="dist-val lost">LOST</span>
+            </div>
+            <div class="dist-bar-track"><div id="distBar3" class="dist-bar s3"></div></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 3. Distance Time-Series Card -->
+      <section class="card chart-card">
+        <div class="card-header">
+          <h2>距離推移グラフ (約15秒)</h2>
+          <span id="chartRangeBadge" class="sub-tag">Y軸: 0〜4.0 m</span>
+        </div>
+        <div class="chart-wrap" id="chartContainer">
+          <canvas id="distChartCanvas"></canvas>
+        </div>
+      </section>
+
+      <!-- 4. Calibration & Controls Card -->
+      <section class="card controls-card">
+        <div class="card-header">
+          <h2>キャリブレーション &amp; 操作</h2>
+          <span id="mappingBadge" class="mapping-badge normal">NORMAL</span>
+        </div>
+
+        <div id="calibText" class="calib-info">
+          S2(Y): 1.00 m (Nom: 1.00m) / S3(X): 1.00 m (Nom: 1.00m)
+        </div>
+
+        <div class="action-buttons">
+          <button id="btnRecalib" class="action-btn primary" type="button">
+            <span>再キャリブレーション</span>
+            <kbd>C</kbd>
+          </button>
+          <button id="btnSwap" class="action-btn" type="button">
+            <span>ポート入替</span>
+            <kbd>R</kbd>
+          </button>
+          <button id="btnClearTrail" class="action-btn" type="button">
+            <span>軌跡クリア</span>
+            <kbd>X</kbd>
+          </button>
+        </div>
+
+        <div class="toggles-grid">
+          <label class="toggle-item">
+            <input type="checkbox" id="chkAutoScale" checked />
+            <span>自動スケール (距離追従)</span>
+          </label>
+          <label class="toggle-item">
+            <input type="checkbox" id="chkCircles" checked />
+            <span>測距円 (Circles)</span>
+          </label>
+          <label class="toggle-item">
+            <input type="checkbox" id="chkDistLines" checked />
+            <span>距離ライン (Lines)</span>
+          </label>
+          <label class="toggle-item">
+            <input type="checkbox" id="chkRangeRings" checked />
+            <span>距離リング (Range Rings)</span>
+          </label>
+          <label class="toggle-item">
+            <input type="checkbox" id="chkFilter" checked />
+            <span>平滑化フィルタ (Filter)</span>
+          </label>
+        </div>
+
+        <div class="slider-row">
+          <div class="slider-head">
+            <label for="sliderHistory">軌跡表示点数 (Trajectory)</label>
+            <span id="historyVal" class="slider-badge">60</span>
+          </div>
+          <input type="range" id="sliderHistory" min="10" max="300" step="5" value="60" />
+        </div>
+      </section>
+    </aside>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>
